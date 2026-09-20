@@ -15,6 +15,7 @@ import threading
 import hashlib
 import zipfile
 import urllib.request
+import webbrowser
 
 CODE_VERSION="IPTV Player v2026.09.20"
 
@@ -22,6 +23,8 @@ PY_BITS = struct.calcsize("P") * 8
 SEEK_GRANULARITY = 5
 
 WEEKDAY_CN = "一二三四五六日"
+
+GITHUB_URL = "https://github.com/blueveryday/IPTV_Player"
 
 COLORS = {
     "bg_root":      "#1e1e1e",
@@ -279,6 +282,9 @@ class SeekBar(tk.Canvas):
 
     def is_dragging(self):
         return self._dragging
+
+    def is_enabled(self):
+        return self._enabled
 
     def set_enabled(self, en):
         self._enabled = bool(en)
@@ -609,8 +615,63 @@ class IPTVApp(tk.Tk):
                            command=self.on_decode_option_changed)
         menubar.add_cascade(label="播放选项", menu=pm)
 
+        menubar.add_command(label="关于", command=self.show_about)
+
         self.menubar = menubar
         self.config(menu=menubar)
+
+    def show_about(self):
+        win = tk.Toplevel(self)
+        win.title("关于")
+        win.configure(bg=COLORS["bg_panel"])
+        win.transient(self)
+        win.resizable(False, False)
+
+        ttk.Label(win, text=CODE_VERSION,
+                  background=COLORS["bg_panel"],
+                  foreground=COLORS["fg_primary"],
+                  font=("Microsoft YaHei UI", 11, "bold")).pack(
+            anchor="w", padx=20, pady=(16, 4))
+
+        ttk.Label(win, text="GitHub 仓库：",
+                  background=COLORS["bg_panel"],
+                  foreground=COLORS["fg_secondary"]).pack(
+            anchor="w", padx=20, pady=(8, 2))
+
+        entry_var = tk.StringVar(value=GITHUB_URL)
+        entry = tk.Entry(win, textvariable=entry_var, width=48,
+                         bg=COLORS["bg_input"], fg=COLORS["fg_primary"],
+                         insertbackground=COLORS["fg_primary"],
+                         relief="flat", highlightthickness=0, bd=0)
+        entry.pack(padx=20, pady=(0, 8), fill=tk.X)
+        entry.configure(state="readonly", readonlybackground=COLORS["bg_input"])
+
+        bf = ttk.Frame(win, style="Panel.TFrame")
+        bf.pack(pady=(4, 14))
+
+        def open_link():
+            try:
+                webbrowser.open(GITHUB_URL)
+            except Exception as e:
+                messagebox.showerror("错误", "无法打开浏览器：%s" % e, parent=win)
+
+        ttk.Button(bf, text="打开链接", command=open_link).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="关闭", command=win.destroy).pack(side=tk.LEFT, padx=6)
+
+        win.update_idletasks()
+        w = win.winfo_width()
+        h = win.winfo_height()
+        px = self.winfo_rootx() + (self.winfo_width() - w) // 2
+        py = self.winfo_rooty() + (self.winfo_height() - h) // 2
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        px = max(0, min(px, sw - w))
+        py = max(0, min(py, sh - h))
+        win.geometry("+%d+%d" % (px, py))
+
+        win.grab_set()
+        entry.focus_set()
+        entry.selection_range(0, tk.END)
 
     def build_ui(self):
         self.grid_rowconfigure(0, weight=1)
@@ -652,9 +713,11 @@ class IPTVApp(tk.Tk):
         sb.config(command=self.ch_list.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.ch_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.ch_list.bind("<Double-Button-1>", lambda e: self.play_live())
+        self.ch_list.bind("<ButtonRelease-1>", self._on_channel_click)
         self.ch_list.bind("<Return>", lambda e: self.play_live())
         self.ch_list.bind("<<ListboxSelect>>", lambda e: self.on_channel_select())
+        self.ch_list.bind("<Up>", self._on_arrow_up)
+        self.ch_list.bind("<Down>", self._on_arrow_down)
 
         self.count_var = tk.StringVar(value="0 个频道")
         ttk.Label(self.left_body, textvariable=self.count_var,
@@ -780,11 +843,171 @@ class IPTVApp(tk.Tk):
         self.bind("<F3>", lambda e: self.toggle_right())
         self.bind("<Escape>", self.on_escape)
 
+        self.bind("<Left>", self._on_arrow_left)
+        self.bind("<Right>", self._on_arrow_right)
+        self.bind("<Up>", self._on_arrow_up)
+        self.bind("<Down>", self._on_arrow_down)
+
         self.refresh_slots()
 
+    def _on_channel_click(self, event=None):
+        try:
+            idx = self.ch_list.nearest(event.y)
+        except Exception:
+            return
+        bbox = self.ch_list.bbox(idx)
+        if not bbox:
+            return
+        y0 = bbox[1]
+        y1 = y0 + bbox[3]
+        if not (y0 <= event.y <= y1):
+            return
+        sel = self.ch_list.curselection()
+        if not sel:
+            return
+        self.play_live()
+
+    def _focus_is_text_input(self):
+        try:
+            w = self.focus_get()
+        except Exception:
+            w = None
+        if w is None:
+            return False
+        try:
+            cls = w.winfo_class()
+        except Exception:
+            return False
+        return cls in ("TEntry", "Entry", "TCombobox", "Text",
+                       "TScale", "TSpinbox", "Spinbox")
+
+    def _current_replay_pos(self):
+        if (self.replay_range_start is None or self.replay_range_end is None
+                or self.replay_anchor_time is None or self.replay_anchor_wall is None):
+            return None
+        elapsed = (self.local_now() - self.replay_anchor_wall).total_seconds()
+        cur = self.replay_anchor_time + timedelta(seconds=elapsed)
+        if cur > self.replay_range_end:
+            cur = self.replay_range_end
+        return cur
+
+    def _seek_replay_by(self, delta_sec):
+        if (self.replay_range_start is None or self.replay_range_end is None):
+            return
+        total_sec = (self.replay_range_end - self.replay_range_start).total_seconds()
+        if total_sec <= 0:
+            return
+        cur = self._current_replay_pos()
+        if cur is None:
+            cur = self.replay_range_start
+        cur_offset = (cur - self.replay_range_start).total_seconds()
+        cur_offset = (int(cur_offset) // SEEK_GRANULARITY) * SEEK_GRANULARITY
+        new_offset = cur_offset + int(delta_sec)
+        max_off = max(0, int(total_sec) - SEEK_GRANULARITY)
+        if new_offset < 0:
+            new_offset = 0
+        if new_offset > max_off:
+            new_offset = max_off
+        value = new_offset * 1000.0 / total_sec
+        self._on_seek_bar(value, "commit")
+
+    def _on_arrow_left(self, event=None):
+        if self._focus_is_text_input():
+            return None
+        try:
+            w = self.focus_get()
+        except Exception:
+            w = None
+        if w is self.slot_list:
+            return None
+        if self.seek_bar.is_dragging():
+            return None
+        if self.current_live:
+            return None
+        if self.replay_range_start is None or self.replay_range_end is None:
+            return None
+        self._seek_replay_by(-SEEK_GRANULARITY)
+        return "break"
+
+    def _on_arrow_right(self, event=None):
+        if self._focus_is_text_input():
+            return None
+        try:
+            w = self.focus_get()
+        except Exception:
+            w = None
+        if w is self.slot_list:
+            return None
+        if self.seek_bar.is_dragging():
+            return None
+        if self.current_live:
+            return None
+        if self.replay_range_start is None or self.replay_range_end is None:
+            return None
+        self._seek_replay_by(SEEK_GRANULARITY)
+        return "break"
+
+    def _on_arrow_up(self, event=None):
+        return self._navigate_channel(-1)
+
+    def _on_arrow_down(self, event=None):
+        return self._navigate_channel(1)
+
+    def _navigate_channel(self, delta):
+        if self._focus_is_text_input():
+            return None
+        try:
+            w = self.focus_get()
+        except Exception:
+            w = None
+        if w is self.slot_list:
+            return None
+        if not self.filtered:
+            return "break"
+
+        sel = self.ch_list.curselection()
+        if sel:
+            idx = sel[0] + delta
+            if idx < 0:
+                idx = 0
+            elif idx >= len(self.filtered):
+                idx = len(self.filtered) - 1
+            if idx == sel[0]:
+                return "break"
+        else:
+            idx = 0
+
+        self.ch_list.selection_clear(0, tk.END)
+        self.ch_list.selection_set(idx)
+        self.ch_list.activate(idx)
+        self.ch_list.see(idx)
+        self.on_channel_select()
+        self.play_live()
+        return "break"
+
+    def _on_slot_click(self, event=None):
+        if self._slots_locked:
+            self.status_var.set("该频道不支持回看，无法选择时段")
+            return "break"
+
+    def _on_slot_key(self, event=None):
+        if self._slots_locked:
+            if event is not None and event.keysym in ("Tab", "ISO_Left_Tab"):
+                return None
+            return "break"
+
+    def _on_slot_select(self, event=None):
+        if self._slots_locked and self.slot_list.curselection():
+            self.slot_list.selection_clear(0, tk.END)
+            self.status_var.set("该频道不支持回看，无法选择时段")
+
+    def _replay_allowed(self):
+        ch = self.selected_channel()
+        if ch is None:
+            return None
+        return replay_supported(ch["url"], self.cfg)
+
     def _on_video_right_click(self, event):
-        """在视频区域右键：弹出日期/时段回看菜单
-        未来时段用纯红色文字（不用 state='disabled'，避免浮雕白边）"""
         ch = self.selected_channel() or self.current
         m = tk.Menu(self, tearoff=0,
                     bg=COLORS["bg_panel"], fg=COLORS["fg_primary"],
@@ -966,32 +1189,6 @@ class IPTVApp(tk.Tk):
             return datetime.strptime(m.group(1), "%Y-%m-%d")
         except ValueError:
             return None
-
-    def _replay_allowed(self):
-        """None=未选择频道；True/False=所选频道是否支持回看。"""
-        ch = self.selected_channel()
-        if ch is None:
-            return None
-        return replay_supported(ch["url"], self.cfg)
-
-    def _on_slot_click(self, event=None):
-        """频道不支持回看时，禁止在时段列表里建立选择。"""
-        if self._slots_locked:
-            self.status_var.set("该频道不支持回看，无法选择时段")
-            return "break"
-
-    def _on_slot_key(self, event=None):
-        """锁定状态下屏蔽键盘选择（方向键、空格等）。"""
-        if self._slots_locked:
-            if event is not None and event.keysym in ("Tab", "ISO_Left_Tab"):
-                return None
-            return "break"
-
-    def _on_slot_select(self, event=None):
-        """兜底：锁定状态下清除任何已产生的选择。"""
-        if self._slots_locked and self.slot_list.curselection():
-            self.slot_list.selection_clear(0, tk.END)
-            self.status_var.set("该频道不支持回看，无法选择时段")
 
     def refresh_slots(self):
         self.slot_list.delete(0, tk.END)
