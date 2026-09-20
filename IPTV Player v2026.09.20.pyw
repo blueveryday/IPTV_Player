@@ -454,6 +454,7 @@ class IPTVApp(tk.Tk):
 
         self.left_btn_col = None
         self.right_btn_col = None
+        self._slots_locked = False
 
         self._setup_ttk_style()
         self.build_menu()
@@ -761,6 +762,9 @@ class IPTVApp(tk.Tk):
         sb2.pack(side=tk.RIGHT, fill=tk.Y)
         self.slot_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.slot_list.bind("<Double-Button-1>", lambda e: self.play_replay())
+        self.slot_list.bind("<Button-1>", self._on_slot_click)
+        self.slot_list.bind("<Key>", self._on_slot_key)
+        self.slot_list.bind("<<ListboxSelect>>", self._on_slot_select)
 
         ttk.Button(self.right_body, text="▶ 回看播放",
                    command=self.play_replay).pack(
@@ -963,19 +967,59 @@ class IPTVApp(tk.Tk):
         except ValueError:
             return None
 
+    def _replay_allowed(self):
+        """None=未选择频道；True/False=所选频道是否支持回看。"""
+        ch = self.selected_channel()
+        if ch is None:
+            return None
+        return replay_supported(ch["url"], self.cfg)
+
+    def _on_slot_click(self, event=None):
+        """频道不支持回看时，禁止在时段列表里建立选择。"""
+        if self._slots_locked:
+            self.status_var.set("该频道不支持回看，无法选择时段")
+            return "break"
+
+    def _on_slot_key(self, event=None):
+        """锁定状态下屏蔽键盘选择（方向键、空格等）。"""
+        if self._slots_locked:
+            if event is not None and event.keysym in ("Tab", "ISO_Left_Tab"):
+                return None
+            return "break"
+
+    def _on_slot_select(self, event=None):
+        """兜底：锁定状态下清除任何已产生的选择。"""
+        if self._slots_locked and self.slot_list.curselection():
+            self.slot_list.selection_clear(0, tk.END)
+            self.status_var.set("该频道不支持回看，无法选择时段")
+
     def refresh_slots(self):
         self.slot_list.delete(0, tk.END)
         day = self.selected_date()
         now = self.local_now()
+        self._slots_locked = (self._replay_allowed() is False)
         for h in range(24):
             raw = "%02d:00 - %s" % (
                 h, "24:00" if h == 23 else "%02d:00" % (h + 1))
             label = "     " + raw
             self.slot_list.insert(tk.END, label)
-            if day and day + timedelta(hours=h) >= now:
+            if self._slots_locked or (day and day + timedelta(hours=h) >= now):
                 self.slot_list.itemconfig(h, fg=COLORS["disabled_fg"])
+        if self._slots_locked:
+            self.slot_list.selection_clear(0, tk.END)
+            try:
+                self.slot_list.configure(cursor="")
+            except Exception:
+                pass
+        else:
+            try:
+                self.slot_list.configure(cursor="hand2")
+            except Exception:
+                pass
 
     def selected_slot(self):
+        if self._slots_locked or self._replay_allowed() is False:
+            return None
         sel = self.slot_list.curselection()
         day = self.selected_date()
         if not sel or day is None:
@@ -1014,6 +1058,7 @@ class IPTVApp(tk.Tk):
         for c in self.filtered:
             self.ch_list.insert(tk.END, c["name"])
         self.count_var.set("%d / %d 个频道" % (len(self.filtered), len(self.channels)))
+        self.refresh_slots()
 
     def selected_channel(self):
         sel = self.ch_list.curselection()
@@ -1026,6 +1071,7 @@ class IPTVApp(tk.Tk):
         if ch:
             tip = "" if replay_supported(ch["url"], self.cfg) else "（不支持回看）"
             self.replay_ch_var.set("%s %s" % (ch["name"], tip))
+        self.refresh_slots()
 
     def init_player(self):
         if vlc is None:
