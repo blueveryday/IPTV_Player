@@ -4,10 +4,9 @@ import re
 import json
 import shutil
 import subprocess
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-from datetime import datetime, timedelta, timezone
-
+import csv
+import time
+import queue
 import importlib
 import site
 import struct
@@ -16,8 +15,12 @@ import hashlib
 import zipfile
 import urllib.request
 import webbrowser
+import urllib.error
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from datetime import datetime, timedelta, timezone
 
-CODE_VERSION="IPTV Player v2026.09.20"
+CODE_VERSION = "IPTV Player v2026.09.20"
 
 PY_BITS = struct.calcsize("P") * 8
 SEEK_GRANULARITY = 5
@@ -43,7 +46,27 @@ COLORS = {
     "btn_bg":       "#333333",
     "btn_active":   "#454545",
     "status_bg":    "#2d2d30",
+    "live_green":   "#5ecb6b",
 }
+
+
+def center_window(win, parent=None):
+    win.update_idletasks()
+    w, h = win.winfo_width(), win.winfo_height()
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    px = py = None
+    if parent is not None:
+        try:
+            px = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+            py = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+        except Exception:
+            px = py = None
+    if px is None:
+        px = (sw - w) // 2
+        py = (sh - h) // 2
+    px = max(0, min(px, sw - w))
+    py = max(0, min(py, sh - h))
+    win.geometry("+%d+%d" % (px, py))
 
 
 def _pe_bits(path):
@@ -254,7 +277,15 @@ DEFAULT_CONFIG = {
     "replay_days": 7,
     "volume": 80,
     "left_width": 250,
+    "epg_auto_update": True,
+    "epg_host": "http://123.147.117.163:8081",
+    "epg_path": "/resource/schedules_v2/{channelcode}_{date}.json",
+    "epg_date_fmt": "%Y%m%d",
+    "epg_csv": "",
+    "epg_threads": 1,
+    "epg_timeout": 10,
 }
+
 
 class SeekBar(tk.Canvas):
     def __init__(self, master, on_seek=None, height=18, **kw):
@@ -287,7 +318,10 @@ class SeekBar(tk.Canvas):
         return self._enabled
 
     def set_enabled(self, en):
-        self._enabled = bool(en)
+        en = bool(en)
+        if en == self._enabled:
+            return
+        self._enabled = en
         try:
             self.configure(cursor="hand2" if en else "")
         except Exception:
@@ -304,14 +338,12 @@ class SeekBar(tk.Canvas):
         self.create_rectangle(0, cy - 3, w, cy + 3,
                               fill=COLORS["border"], outline="")
         fw = int(w * self._value / 1000.0)
-        color = COLORS["accent"] if self._enabled else COLORS["fg_dim"]
         if fw > 0:
             self.create_rectangle(0, cy - 3, fw, cy + 3,
-                                  fill=color, outline="")
+                                  fill=COLORS["accent"], outline="")
         tx = max(6, min(w - 6, fw))
-        outline_c = COLORS["accent"] if self._enabled else COLORS["fg_dim"]
         self.create_oval(tx - 6, cy - 6, tx + 6, cy + 6,
-                         fill=COLORS["bg_panel"], outline=outline_c, width=2)
+                         fill=COLORS["bg_panel"], outline=COLORS["accent"], width=2)
 
     def _x_to_value(self, x):
         w = self.winfo_width()
@@ -344,6 +376,7 @@ class SeekBar(tk.Canvas):
         self.set_value(v)
         if self._on_seek:
             self._on_seek(v, "commit")
+
 
 def read_text_auto(path):
     raw = open(path, "rb").read()
@@ -429,6 +462,309 @@ def build_replay_url(base_url, start_local, end_local, cfg):
     return base_url + sep + "&".join(params)
 
 
+EPG_TOOL_DIR = os.path.join(APP_DIR, "src")
+EPG_DIR = os.path.join(EPG_TOOL_DIR, "epg")
+EPG_CSV = os.path.join(EPG_TOOL_DIR, "channel_epg_chongqing.csv")
+EPG_MISS_FILE = os.path.join(EPG_DIR, ".miss.json")
+EPG_URL = "http://123.147.117.163:8081/resource/schedules_v2/{channelcode}_{date}.json"
+EPG_TIMEOUT = 10
+EPG_RETRY = 2
+EPG_THREADS = 1
+EPG_MISS_TTL = 6 * 3600
+EPG_FILE_RE = re.compile(r"_(\d{8})\.json$", re.I)
+_epg_cache = {}
+
+
+def _norm_name(s):
+    return re.sub(r'[\\/:*?"<>|_\s]+', "", s or "").lower()
+
+
+def find_epg_dir(name):
+    if not os.path.isdir(EPG_DIR):
+        return None
+    p = os.path.join(EPG_DIR, name)
+    if os.path.isdir(p):
+        return p
+    key = _norm_name(name)
+    try:
+        for d in os.listdir(EPG_DIR):
+            fp = os.path.join(EPG_DIR, d)
+            if os.path.isdir(fp) and _norm_name(d) == key:
+                return fp
+    except OSError:
+        pass
+    return None
+
+
+def _parse_epg_file(path):
+    items = []
+    try:
+        data = json.loads(read_text_auto(path))
+    except Exception:
+        return items
+    fmt = "%Y-%m-%d %H:%M:%S"
+    for s in (data.get("schedules") or []):
+        try:
+            st = datetime.strptime(s["starttime"], fmt)
+            et = datetime.strptime(s["endtime"], fmt)
+        except Exception:
+            continue
+        if et <= st:
+            continue
+        items.append({"title": str(s.get("title") or "").strip(),
+                      "start": st, "end": et})
+    return items
+
+
+def load_epg(channel_name, day):
+    """day: datetime.date。返回该日的节目列表（按开始时间排序），没有则返回 []。"""
+    d = find_epg_dir(channel_name)
+    if not d:
+        return []
+    suffix = "_%s.json" % day.strftime("%Y%m%d")
+    try:
+        files = [f for f in os.listdir(d) if f.lower().endswith(suffix)]
+    except OSError:
+        return []
+    progs = []
+    for f in files:
+        path = os.path.join(d, f)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        hit = _epg_cache.get(path)
+        if hit and hit[0] == mtime:
+            items = hit[1]
+        else:
+            items = _parse_epg_file(path)
+            _epg_cache[path] = (mtime, items)
+        progs.extend(items)
+    day_start = datetime(day.year, day.month, day.day)
+    day_end = day_start + timedelta(days=1)
+    seen, result = set(), []
+    for p in sorted(progs, key=lambda x: x["start"]):
+        if not (p["start"] < day_end and p["end"] > day_start):
+            continue
+        k = (p["start"], p["end"], p["title"])
+        if k in seen:
+            continue
+        seen.add(k)
+        result.append(p)
+    return result
+
+
+def fmt_range(start, end):
+    e = "24:00" if (end.hour == 0 and end.minute == 0 and end.date() > start.date()) \
+        else end.strftime("%H:%M")
+    return "%s-%s" % (start.strftime("%H:%M"), e)
+
+
+def _epg_url_fn(cfg):
+    """由配置生成 (channelcode, 'YYYYMMDD') -> 完整下载地址 的函数"""
+    host = (cfg.get("epg_host") or "").strip().rstrip("/")
+    path = (cfg.get("epg_path") or "").strip()
+    if path and not path.startswith(("/", "?")):
+        path = "/" + path
+    tpl = host + path
+    fmt = (cfg.get("epg_date_fmt") or "").strip() or "%Y%m%d"
+
+    def make(code, d):
+        ds = datetime.strptime(d, "%Y%m%d").strftime(fmt)
+        return tpl.format(channelcode=code, date=ds)
+    return make
+
+
+def epg_csv_path(cfg):
+    p = (cfg.get("epg_csv") or "").strip().strip('"')
+    if not p:
+        return EPG_CSV
+    return p if os.path.isabs(p) else os.path.join(APP_DIR, p)
+
+
+def epg_clear_all():
+    if os.path.isdir(EPG_DIR):
+        shutil.rmtree(EPG_DIR, ignore_errors=True)
+    _epg_cache.clear()
+
+
+def epg_folder_name(name):
+    name = re.sub(r'[\\/:*?"<>|]', "_", name or "").strip().rstrip(".")
+    return name or "_"
+
+
+def load_epg_channels(csv_path):
+    items, seen = [], set()
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        fm = {(k or "").strip().lower(): k for k in (reader.fieldnames or [])}
+        cf, tf = fm.get("channelcode"), fm.get("title")
+        if not cf or not tf:
+            raise RuntimeError("channel_epg_chongqing.csv 缺少 channelcode 或 title 字段")
+        for row in reader:
+            code = (row.get(cf) or "").strip()
+            title = (row.get(tf) or "").strip()
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            items.append((code, title or code))
+    return items
+
+
+def epg_valid_dates(today, n):
+    """[今天-(n-1) … 今天]，格式 YYYYMMDD"""
+    return [(today - timedelta(days=i)).strftime("%Y%m%d")
+            for i in range(n - 1, -1, -1)]
+
+
+def _load_miss():
+    try:
+        with open(EPG_MISS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_miss(d):
+    try:
+        os.makedirs(EPG_DIR, exist_ok=True)
+        with open(EPG_MISS_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f)
+    except Exception:
+        pass
+
+
+def _epg_fetch(url, timeout=EPG_TIMEOUT):
+    hdr = {"User-Agent": "Mozilla/5.0 (IPTVPlayer)"}
+    for attempt in range(EPG_RETRY):
+        try:
+            req = urllib.request.Request(url, headers=hdr)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return "ok", r.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return "nodata", None
+        except Exception:
+            pass
+        if attempt < EPG_RETRY - 1:
+            time.sleep(1)
+    return "error", None
+
+
+def epg_cleanup(valid_dates):
+    removed = 0
+    if not os.path.isdir(EPG_DIR):
+        return 0
+    keep = set(valid_dates)
+    for sub in os.listdir(EPG_DIR):
+        sp = os.path.join(EPG_DIR, sub)
+        if not os.path.isdir(sp):
+            continue
+        for f in os.listdir(sp):
+            fp = os.path.join(sp, f)
+            m = EPG_FILE_RE.search(f)
+            stale = (m and m.group(1) not in keep) or f.lower().endswith(".json.tmp")
+            if stale:
+                try:
+                    os.remove(fp)
+                    removed += 1
+                    _epg_cache.pop(fp, None)
+                except OSError:
+                    pass
+        try:
+            os.rmdir(sp)
+        except OSError:
+            pass
+    return removed
+
+
+def epg_update_worker(state, today, n, force_dates):
+    try:
+        dates = epg_valid_dates(today, n)
+        state["removed"] = epg_cleanup(dates)
+
+        csv_path = state["csv"]
+        if not os.path.isfile(csv_path):
+            state["error"] = "未找到频道表：%s" % csv_path
+            return
+        channels = load_epg_channels(csv_path)
+
+        miss = _load_miss()
+        now_ts = time.time()
+        jobs = []
+        for code, title in channels:
+            folder = os.path.join(EPG_DIR, epg_folder_name(title))
+            for d in dates:
+                fp = os.path.join(folder, "%s_%s.json" % (code, d))
+                if d not in force_dates:
+                    if os.path.isfile(fp):
+                        continue
+                    if now_ts - miss.get("%s_%s" % (code, d), 0) < EPG_MISS_TTL:
+                        continue
+                jobs.append((code, d, folder, fp))
+        state["total"] = len(jobs)
+
+        lock = threading.Lock()
+        q = queue.Queue()
+        for j in jobs:
+            q.put(j)
+
+        def run(job):
+            code, d, folder, fp = job
+            key = "%s_%s" % (code, d)
+            status = "error"
+            try:
+                status, body = _epg_fetch(state["url_fn"](code, d), state["timeout"])
+                if status == "ok":
+                    try:
+                        data = json.loads(body.decode("utf-8-sig"))
+                        if not (isinstance(data, dict) and data.get("schedules")):
+                            status = "nodata"
+                    except Exception:
+                        status = "error"
+                if status == "ok":
+                    os.makedirs(folder, exist_ok=True)
+                    tmp = fp + ".tmp"
+                    with open(tmp, "wb") as f:
+                        f.write(body)
+                    os.replace(tmp, fp)
+            except Exception:
+                status = "error"
+            with lock:
+                if status == "ok":
+                    state["ok"] += 1
+                    miss.pop(key, None)
+                elif status == "nodata":
+                    state["nodata"] += 1
+                    miss[key] = time.time()
+                else:
+                    state["fail"] += 1
+                state["done"] += 1
+
+        def loop():
+            while not state["cancel"]:
+                try:
+                    job = q.get_nowait()
+                except queue.Empty:
+                    return
+                run(job)
+
+        ths = [threading.Thread(target=loop, daemon=True)
+               for _ in range(state["threads"])]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join()
+
+        keep = set(dates)
+        _save_miss({k: v for k, v in miss.items() if k.rsplit("_", 1)[-1] in keep})
+    except Exception as e:
+        state["error"] = str(e)
+    finally:
+        state["finished"] = True
+
+
 class IPTVApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -461,6 +797,9 @@ class IPTVApp(tk.Tk):
         self.left_btn_col = None
         self.right_btn_col = None
         self._slots_locked = False
+        self.slot_items = []
+        self.epg_state = None
+        self._live_rewind_mode = False
 
         self._setup_ttk_style()
         self.build_menu()
@@ -470,6 +809,7 @@ class IPTVApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(200, self.load_default)
         self.after(500, self._update_progress)
+        self.after(1500, self.auto_epg_update)
 
     def _setup_ttk_style(self):
         style = ttk.Style(self)
@@ -510,8 +850,9 @@ class IPTVApp(tk.Tk):
                         bordercolor=COLORS["border"])
         style.map("TCombobox",
                   fieldbackground=[("readonly", COLORS["bg_input"])],
-                  foreground=[("readonly", COLORS["fg_primary"])])
-
+                  foreground=[("readonly", COLORS["fg_primary"])],
+                  selectbackground=[("readonly", COLORS["bg_input"])],
+                  selectforeground=[("readonly", COLORS["fg_primary"])])
         style.configure("TButton", background=COLORS["btn_bg"],
                         foreground=COLORS["fg_primary"],
                         bordercolor=COLORS["border"],
@@ -615,6 +956,15 @@ class IPTVApp(tk.Tk):
                            command=self.on_decode_option_changed)
         menubar.add_cascade(label="播放选项", menu=pm)
 
+        em = tk.Menu(menubar, tearoff=0, bg=COLORS["bg_panel"],
+                     fg=COLORS["fg_primary"],
+                     disabledforeground=COLORS["disabled_fg"],
+                     activebackground=COLORS["accent_dim"],
+                     activeforeground="#ffffff")
+        em.add_command(label="下载 EPG", command=self.manual_epg_update)
+        em.add_command(label="自定义 EPG 下载参数...", command=self.open_epg_settings)
+        menubar.add_cascade(label="EPG选项", menu=em)
+
         menubar.add_command(label="关于", command=self.show_about)
 
         self.menubar = menubar
@@ -633,45 +983,36 @@ class IPTVApp(tk.Tk):
                   font=("Microsoft YaHei UI", 11, "bold")).pack(
             anchor="w", padx=20, pady=(16, 4))
 
-        ttk.Label(win, text="GitHub 仓库：",
+        ttk.Label(win, text="GitHub 仓库（点击打开）：",
                   background=COLORS["bg_panel"],
                   foreground=COLORS["fg_secondary"]).pack(
             anchor="w", padx=20, pady=(8, 2))
 
-        entry_var = tk.StringVar(value=GITHUB_URL)
-        entry = tk.Entry(win, textvariable=entry_var, width=48,
-                         bg=COLORS["bg_input"], fg=COLORS["fg_primary"],
-                         insertbackground=COLORS["fg_primary"],
-                         relief="flat", highlightthickness=0, bd=0)
-        entry.pack(padx=20, pady=(0, 8), fill=tk.X)
-        entry.configure(state="readonly", readonlybackground=COLORS["bg_input"])
-
-        bf = ttk.Frame(win, style="Panel.TFrame")
-        bf.pack(pady=(4, 14))
-
-        def open_link():
+        def open_link(_e=None):
             try:
                 webbrowser.open(GITHUB_URL)
             except Exception as e:
                 messagebox.showerror("错误", "无法打开浏览器：%s" % e, parent=win)
 
-        ttk.Button(bf, text="打开链接", command=open_link).pack(side=tk.LEFT, padx=6)
+        link = tk.Label(win, text=GITHUB_URL, anchor="w", justify=tk.LEFT,
+                        wraplength=460, padx=8, pady=6,
+                        bg=COLORS["bg_input"], fg=COLORS["accent"],
+                        cursor="hand2")
+        link.pack(fill=tk.X, padx=20, pady=(0, 8))
+
+        base_font = ("Microsoft YaHei UI", 9, "normal")
+        hover_font = ("Microsoft YaHei UI", 9, "underline")
+        link.configure(font=base_font)
+        link.bind("<Button-1>", open_link)
+        link.bind("<Enter>", lambda e: link.configure(font=hover_font))
+        link.bind("<Leave>", lambda e: link.configure(font=base_font))
+
+        bf = ttk.Frame(win, style="Panel.TFrame")
+        bf.pack(pady=(4, 14))
         ttk.Button(bf, text="关闭", command=win.destroy).pack(side=tk.LEFT, padx=6)
 
-        win.update_idletasks()
-        w = win.winfo_width()
-        h = win.winfo_height()
-        px = self.winfo_rootx() + (self.winfo_width() - w) // 2
-        py = self.winfo_rooty() + (self.winfo_height() - h) // 2
-        sw = win.winfo_screenwidth()
-        sh = win.winfo_screenheight()
-        px = max(0, min(px, sw - w))
-        py = max(0, min(py, sh - h))
-        win.geometry("+%d+%d" % (px, py))
-
         win.grab_set()
-        entry.focus_set()
-        entry.selection_range(0, tk.END)
+        center_window(win, self)
 
     def build_ui(self):
         self.grid_rowconfigure(0, weight=1)
@@ -796,31 +1137,39 @@ class IPTVApp(tk.Tk):
 
         self.replay_ch_var = tk.StringVar(value="未选择频道")
         ttk.Label(self.right_body, textvariable=self.replay_ch_var,
-                  style="Dim.TLabel", wraplength=180,
-                  justify=tk.LEFT).pack(anchor="w", padx=8, pady=(8, 4))
+                  style="Dim.TLabel", wraplength=260,
+                  justify=tk.LEFT).pack(anchor="w", padx=8, pady=(8, 2))
+
+        self.epg_var = tk.StringVar(value="")
+        ttk.Label(self.right_body, textvariable=self.epg_var,
+                  style="Dim.TLabel").pack(anchor="w", padx=8, pady=(0, 4))
 
         df = ttk.Frame(self.right_body, style="Panel.TFrame")
         df.pack(fill=tk.X, padx=8, pady=4)
-        ttk.Label(df, text="日期", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(df, text="回看", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 4))
         self.date_var = tk.StringVar()
         self.date_cb = ttk.Combobox(df, textvariable=self.date_var, width=18,
                                     values=self.date_choices(), state="readonly")
         self.date_cb.pack(side=tk.LEFT, padx=2)
         self.date_cb.current(0)
-        self.date_cb.bind("<<ComboboxSelected>>", lambda e: self.refresh_slots())
+        self.date_cb.bind("<<ComboboxSelected>>", self._on_date_selected)
         self.date_cb.bind("<Return>", lambda e: self.refresh_slots())
+        self.date_cb.bind("<Up>", lambda e: self._step_date(-1))
+        self.date_cb.bind("<Down>", lambda e: self._step_date(1))
 
         sf2 = ttk.Frame(self.right_body, style="Panel.TFrame")
         sf2.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
         sb2 = ttk.Scrollbar(sf2, orient=tk.VERTICAL)
+
         self.slot_list = tk.Listbox(sf2, exportselection=False, yscrollcommand=sb2.set,
-                                    font=("Consolas", 10),
+                                    font=("Microsoft YaHei UI", 10),
                                     bg=COLORS["bg_input"],
                                     fg=COLORS["fg_primary"],
                                     selectbackground=COLORS["select_bg"],
                                     selectforeground=COLORS["select_fg"],
                                     highlightthickness=0, bd=0,
-                                    relief="flat", width=18)
+                                    relief="flat", width=32)
+
         sb2.config(command=self.slot_list.yview)
         sb2.pack(side=tk.RIGHT, fill=tk.Y)
         self.slot_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -828,6 +1177,13 @@ class IPTVApp(tk.Tk):
         self.slot_list.bind("<Button-1>", self._on_slot_click)
         self.slot_list.bind("<Key>", self._on_slot_key)
         self.slot_list.bind("<<ListboxSelect>>", self._on_slot_select)
+
+        for w in (self.slot_list, self.ch_list, self.date_cb):
+            w.bind("<Left>", lambda e: self._seek_arrow(-SEEK_GRANULARITY))
+            w.bind("<Right>", lambda e: self._seek_arrow(SEEK_GRANULARITY))
+
+        self.slot_list.bind("<Return>", lambda e: (self.play_replay(), "break")[1])
+        self.slot_list.bind("<KP_Enter>", lambda e: (self.play_replay(), "break")[1])
 
         ttk.Button(self.right_body, text="▶ 回看播放",
                    command=self.play_replay).pack(
@@ -894,12 +1250,16 @@ class IPTVApp(tk.Tk):
     def _seek_replay_by(self, delta_sec):
         if (self.replay_range_start is None or self.replay_range_end is None):
             return
+        if self._live_rewind_mode:
+            self.replay_range_end = self.local_now()
+            cur = self.replay_anchor_time
+        else:
+            cur = self._current_replay_pos()
+            if cur is None:
+                cur = self.replay_range_start
         total_sec = (self.replay_range_end - self.replay_range_start).total_seconds()
         if total_sec <= 0:
             return
-        cur = self._current_replay_pos()
-        if cur is None:
-            cur = self.replay_range_start
         cur_offset = (cur - self.replay_range_start).total_seconds()
         cur_offset = (int(cur_offset) // SEEK_GRANULARITY) * SEEK_GRANULARITY
         new_offset = cur_offset + int(delta_sec)
@@ -911,19 +1271,105 @@ class IPTVApp(tk.Tk):
         value = new_offset * 1000.0 / total_sec
         self._on_seek_bar(value, "commit")
 
+    def _live_rewind_to(self, new_time):
+        ch = self.current
+        if not ch:
+            return
+        now = self.local_now()
+        if new_time >= now:
+            self._resume_live()
+            return
+        self.replay_anchor_time = new_time
+        self.replay_anchor_wall = now
+        self.replay_range_end = now
+        total_sec = (self.replay_range_end - self.replay_range_start).total_seconds()
+        if total_sec > 0:
+            offset = (new_time - self.replay_range_start).total_seconds()
+            self.seek_bar.set_value(max(0.0, min(1000.0, offset * 1000.0 / total_sec)))
+        url = build_replay_url(ch["url"], new_time, now, self.cfg)
+        title = "[回看] %s %s - %s" % (
+            ch["name"], new_time.strftime("%Y-%m-%d %H:%M:%S"),
+            now.strftime("%H:%M:%S"))
+        self.play_url(url, title, live=False)
+        self.status_var.set("已前进到 %s 回看" % new_time.strftime("%H:%M:%S"))
+
+    def _find_epg_bounds_for_now(self, ch, now):
+        progs = load_epg(ch["name"], now.date())
+        for p in progs:
+            if p["start"] <= now < p["end"]:
+                return p["start"], p["end"]
+        if now.hour < 6:
+            for p in load_epg(ch["name"], (now - timedelta(days=1)).date()):
+                if p["start"] <= now < p["end"]:
+                    return p["start"], p["end"]
+        past = [p for p in progs if p["end"] <= now]
+        if past:
+            p = max(past, key=lambda x: x["end"])
+            return p["start"], p["end"]
+        return None
+
+    def _live_rewind_start(self):
+        ch = self.current
+        if not ch:
+            return
+        now = self.local_now()
+        if self.replay_range_start is None:
+            bounds = self._find_epg_bounds_for_now(ch, now)
+            if bounds is None:
+                self.status_var.set("没有可用的 EPG 数据，无法倒退")
+                return
+            self.replay_range_start = bounds[0]
+            self.replay_anchor_time = now
+            self.replay_anchor_wall = now
+            self.replay_range_end = now
+            try:
+                self.seek_bar.set_enabled(True)
+            except Exception:
+                pass
+        self._live_rewind_mode = True
+
+        new_time = self.replay_anchor_time - timedelta(seconds=SEEK_GRANULARITY)
+        if new_time < self.replay_range_start:
+            new_time = self.replay_range_start
+        if new_time >= self.replay_anchor_time:
+            self.status_var.set("已到达该时段最早时间（%s），无法继续倒退" %
+                                self.replay_range_start.strftime("%H:%M:%S"))
+            return
+        self.replay_anchor_time = new_time
+        self.replay_anchor_wall = now
+        self.replay_range_end = now
+        # 立即刷新进度条，避免等到下一帧
+        total_sec = (self.replay_range_end - self.replay_range_start).total_seconds()
+        if total_sec > 0:
+            offset = (new_time - self.replay_range_start).total_seconds()
+            try:
+                self.seek_bar.set_value(max(0.0, min(1000.0, offset * 1000.0 / total_sec)))
+            except Exception:
+                pass
+        url = build_replay_url(ch["url"], new_time, now, self.cfg)
+        title = "[回看] %s %s - %s" % (
+            ch["name"], new_time.strftime("%Y-%m-%d %H:%M:%S"),
+            now.strftime("%H:%M:%S"))
+        self.play_url(url, title, live=False)
+        self.status_var.set("已倒推到 %s 回看" % new_time.strftime("%H:%M:%S"))
+
+    def _resume_live(self):
+        ch = self.current
+        if not ch:
+            return
+        self._clear_replay_range()
+        self.play_url(ch["url"], "[直播] " + ch["name"], live=True)
+        self._refresh_live_bar()
+        self.status_var.set("已恢复直播：%s" % ch["name"])
+
     def _on_arrow_left(self, event=None):
         if self._focus_is_text_input():
-            return None
-        try:
-            w = self.focus_get()
-        except Exception:
-            w = None
-        if w is self.slot_list:
             return None
         if self.seek_bar.is_dragging():
             return None
         if self.current_live:
-            return None
+            self._live_rewind_start()
+            return "break"
         if self.replay_range_start is None or self.replay_range_end is None:
             return None
         self._seek_replay_by(-SEEK_GRANULARITY)
@@ -932,20 +1378,29 @@ class IPTVApp(tk.Tk):
     def _on_arrow_right(self, event=None):
         if self._focus_is_text_input():
             return None
-        try:
-            w = self.focus_get()
-        except Exception:
-            w = None
-        if w is self.slot_list:
-            return None
         if self.seek_bar.is_dragging():
             return None
         if self.current_live:
-            return None
+            return "break"
         if self.replay_range_start is None or self.replay_range_end is None:
             return None
+        if self._live_rewind_mode:
+            now = self.local_now()
+            new_time = self.replay_anchor_time + timedelta(seconds=SEEK_GRANULARITY)
+            if new_time >= now:
+                self._resume_live()
+                return "break"
+            self._live_rewind_to(new_time)
+            return "break"
         self._seek_replay_by(SEEK_GRANULARITY)
         return "break"
+
+    def _seek_arrow(self, delta):
+        if self.seek_bar.is_dragging():
+            return "break"
+        if delta < 0:
+            return self._on_arrow_left()
+        return self._on_arrow_right()
 
     def _on_arrow_up(self, event=None):
         return self._navigate_channel(-1)
@@ -1043,11 +1498,8 @@ class IPTVApp(tk.Tk):
                                    disabledforeground=COLORS["disabled_fg"],
                                    activebackground=COLORS["accent_dim"],
                                    activeforeground="#ffffff")
-                for h in range(24):
-                    label = "%02d:00 - %s" % (
-                        h, "24:00" if h == 23 else "%02d:00" % (h + 1))
-                    start = datetime(d.year, d.month, d.day) + timedelta(hours=h)
-                    end = start + timedelta(hours=1)
+                slots, _ = self.build_day_slots(ch, d)
+                for label, start, end in slots:
                     if start >= now or d < earliest:
                         day_menu.add_command(
                             label=label,
@@ -1059,6 +1511,7 @@ class IPTVApp(tk.Tk):
                         day_menu.add_command(
                             label=label,
                             command=lambda c=ch, s=start, e=end: self._play_replay_at(c, s, e))
+
                 replay_menu.add_cascade(label=display, menu=day_menu)
             m.add_cascade(label="回看", menu=replay_menu)
 
@@ -1075,8 +1528,8 @@ class IPTVApp(tk.Tk):
         self.replay_range_end = None
         self.replay_anchor_time = None
         self.replay_anchor_wall = None
+        self._live_rewind_mode = False
         try:
-            self.seek_bar.set_enabled(False)
             self.seek_bar.set_value(0)
         except Exception:
             pass
@@ -1086,9 +1539,19 @@ class IPTVApp(tk.Tk):
         self.replay_range_end = end
         self.replay_anchor_time = start
         self.replay_anchor_wall = self.local_now()
+        self._live_rewind_mode = False
         try:
             self.seek_bar.set_enabled(True)
             self.seek_bar.set_value(0)
+        except Exception:
+            pass
+
+    def _refresh_live_bar(self):
+        try:
+            self.seek_bar.set_enabled(True)
+            self.seek_bar.set_value(1000)
+            now_str = self.local_now().strftime("%H:%M:%S")
+            self.time_var.set("%s / %s" % (now_str, now_str))
         except Exception:
             pass
 
@@ -1097,24 +1560,39 @@ class IPTVApp(tk.Tk):
         try:
             if self.seek_bar.is_dragging():
                 pass
+            elif self.current_live and self.replay_range_start is None:
+                if self.current is not None:
+                    self._refresh_live_bar()
+                else:
+                    self.seek_bar.set_enabled(False)
+                    self.seek_bar.set_value(0)
+                    self.time_var.set("--:--:-- / --:--:--")
             elif (self.replay_range_start is not None
                   and self.replay_range_end is not None
                   and self.replay_anchor_time is not None
                   and self.replay_anchor_wall is not None):
                 now = self.local_now()
-                elapsed = (now - self.replay_anchor_wall).total_seconds()
-                cur = self.replay_anchor_time + timedelta(seconds=elapsed)
-                if cur > self.replay_range_end:
-                    cur = self.replay_range_end
-                total_sec = (self.replay_range_end - self.replay_range_start).total_seconds()
+                if self._live_rewind_mode:
+                    self.replay_range_end = now
+                    cur = self.replay_anchor_time
+                    right = now
+                else:
+                    elapsed = (now - self.replay_anchor_wall).total_seconds()
+                    cur = self.replay_anchor_time + timedelta(seconds=elapsed)
+                    if cur > self.replay_range_end:
+                        cur = self.replay_range_end
+                    right = self.replay_range_end
+                total_sec = (self.replay_range_end
+                             - self.replay_range_start).total_seconds()
                 if total_sec > 0:
                     offset = (cur - self.replay_range_start).total_seconds()
                     pos = max(0.0, min(1000.0, offset * 1000.0 / total_sec))
                     self.seek_bar.set_value(pos)
                     self.time_var.set("%s / %s" % (
                         cur.strftime("%H:%M:%S"),
-                        self.replay_range_end.strftime("%H:%M:%S")))
+                        right.strftime("%H:%M:%S")))
             else:
+                self.seek_bar.set_enabled(False)
                 self.seek_bar.set_value(0)
                 self.time_var.set("--:--:-- / --:--:--")
         except Exception:
@@ -1125,9 +1603,29 @@ class IPTVApp(tk.Tk):
             pass
 
     def _on_seek_bar(self, value, phase):
-        if (self.replay_range_start is None
-                or self.replay_range_end is None):
-            return
+        ch = self.current
+        if self.replay_range_start is None or self.replay_range_end is None:
+            if not ch:
+                try:
+                    self.seek_bar.set_value(1000 if self.current_live else 0)
+                except Exception:
+                    pass
+                return
+            now = self.local_now()
+            bounds = self._find_epg_bounds_for_now(ch, now)
+            if bounds is None:
+                self.status_var.set("没有可用的 EPG 数据，无法拖动进度")
+                try:
+                    self.seek_bar.set_value(1000)
+                except Exception:
+                    pass
+                return
+            self.replay_range_start = bounds[0]
+            self.replay_range_end = now
+            self.replay_anchor_time = now
+            self.replay_anchor_wall = now
+            self._live_rewind_mode = True
+
         total_sec = (self.replay_range_end - self.replay_range_start).total_seconds()
         if total_sec <= 0:
             return
@@ -1137,13 +1635,26 @@ class IPTVApp(tk.Tk):
             offset_sec = max(0, int(total_sec) - SEEK_GRANULARITY)
         target = self.replay_range_start + timedelta(seconds=offset_sec)
 
+        at_right = (value >= 999 or
+                    target >= self.replay_range_end - timedelta(seconds=SEEK_GRANULARITY))
+        if self._live_rewind_mode and at_right:
+            if phase == "preview":
+                end_str = self.replay_range_end.strftime("%H:%M:%S")
+                self.time_var.set("%s / %s" % (end_str, end_str))
+                return
+            if self.current_live:
+                self._clear_replay_range()
+                self._refresh_live_bar()
+            else:
+                self._resume_live()
+            return
+
         if phase == "preview":
             self.time_var.set("%s / %s" % (
                 target.strftime("%H:%M:%S"),
                 self.replay_range_end.strftime("%H:%M:%S")))
             return
 
-        ch = self.current
         if not ch or self.player is None:
             return
         url = build_replay_url(ch["url"], target, self.replay_range_end, self.cfg)
@@ -1190,18 +1701,255 @@ class IPTVApp(tk.Tk):
         except ValueError:
             return None
 
+    def build_day_slots(self, ch, day_date):
+        """返回 ([(label, start, end), ...], from_epg)。有 EPG 用节目，否则用整点。"""
+        progs = load_epg(ch["name"], day_date) if ch else []
+        if progs:
+            return [("%s  %s" % (fmt_range(p["start"], p["end"]), p["title"]),
+                     p["start"], p["end"]) for p in progs], True
+        base = datetime(day_date.year, day_date.month, day_date.day)
+        slots = []
+        for h in range(24):
+            s = base + timedelta(hours=h)
+            e = s + timedelta(hours=1)
+            slots.append((fmt_range(s, e), s, e))
+        return slots, False
+
+    def auto_epg_update(self):
+        if self.cfg.get("epg_auto_update", True):
+            self.start_epg_update(silent=True)
+
+    def manual_epg_update(self):
+        self.start_epg_update(silent=False)
+
+    def open_epg_settings(self):
+        win = tk.Toplevel(self)
+        win.title("自定义 EPG 下载参数")
+        win.configure(bg=COLORS["bg_panel"])
+        win.transient(self)
+        win.resizable(False, False)
+
+        sample = "00000001000000050000000000000476"
+        today_str = self.local_now().strftime("%Y%m%d")
+        rows = [("服务器地址", "epg_host"),
+                ("路径模板", "epg_path"),
+                ("日期格式（strftime）", "epg_date_fmt"),
+                ("频道表 CSV（空=src/channel_epg_chongqing.csv）", "epg_csv"),
+                ("下载线程数（1-10）", "epg_threads"),
+                ("超时秒数（3-10）", "epg_timeout")]
+        vars_ = {}
+        for i, (label, key) in enumerate(rows):
+            ttk.Label(win, text=label, background=COLORS["bg_panel"],
+                      foreground=COLORS["fg_primary"]).grid(
+                row=i, column=0, sticky="e", padx=10, pady=6)
+            v = tk.StringVar(value=str(self.cfg.get(key, DEFAULT_CONFIG[key])))
+            ttk.Entry(win, textvariable=v, width=54).grid(
+                row=i, column=1, padx=(10, 4), pady=6)
+            vars_[key] = v
+
+        def browse():
+            p = filedialog.askopenfilename(
+                parent=win, filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")])
+            if p:
+                vars_["epg_csv"].set(p)
+        ttk.Button(win, text="浏览…", command=browse).grid(row=3, column=2, padx=(0, 10))
+
+        r = len(rows)
+        ttk.Label(win, text="可用变量：{channelcode} 频道代码，{date} 按“日期格式”生成的日期。\n"
+                            "最终地址 = 服务器地址 + 路径模板（路径模板可含 ?参数）。\n"
+                            "本地文件仍统一保存为 频道代码_YYYYMMDD.json。",
+                  style="Dim.TLabel", justify=tk.LEFT).grid(
+            row=r, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 2))
+        pv = tk.StringVar()
+        ttk.Label(win, text="地址预览", style="Dim.TLabel").grid(
+            row=r + 1, column=0, sticky="ne", padx=10, pady=4)
+        tk.Label(win, textvariable=pv, bg=COLORS["bg_panel"], fg=COLORS["accent"],
+                 wraplength=460, justify=tk.LEFT, anchor="w").grid(
+            row=r + 1, column=1, columnspan=2, sticky="w", padx=10, pady=4)
+
+        def refresh_preview(*_):
+            try:
+                c = {k: v.get().strip() for k, v in vars_.items()}
+                pv.set(_epg_url_fn(c)(sample, today_str))
+            except Exception as e:
+                pv.set("（格式有误：%s）" % e)
+        for v in vars_.values():
+            v.trace_add("write", refresh_preview)
+        refresh_preview()
+
+        def collect():
+            c = {k: v.get().strip() for k, v in vars_.items()}
+            c["epg_csv"] = c["epg_csv"].strip('"')
+            if not c["epg_host"].lower().startswith(("http://", "https://")):
+                raise ValueError("服务器地址必须以 http:// 或 https:// 开头")
+            for var in ("{channelcode}", "{date}"):
+                if var not in c["epg_path"]:
+                    raise ValueError("路径模板必须包含 %s" % var)
+            try:
+                c["epg_threads"] = max(1, min(10, int(c["epg_threads"])))
+                c["epg_timeout"] = max(3, min(10, int(c["epg_timeout"])))
+            except ValueError:
+                raise ValueError("线程数和超时秒数必须为整数")
+            c["epg_date_fmt"] = c["epg_date_fmt"] or "%Y%m%d"
+            try:
+                _epg_url_fn(c)(sample, today_str)
+            except Exception as e:
+                raise ValueError("地址模板有误（含未知变量或花括号不匹配）：%s" % e)
+            return c
+
+        def save(download):
+            st = self.epg_state
+            if st and not st["finished"]:
+                messagebox.showinfo("提示", "EPG 正在更新中，请稍后再修改。", parent=win)
+                return
+            try:
+                c = collect()
+            except ValueError as e:
+                messagebox.showerror("错误", str(e), parent=win)
+                return
+            addr_keys = ("epg_host", "epg_path", "epg_date_fmt", "epg_csv")
+            changed = any(str(self.cfg.get(k, DEFAULT_CONFIG[k])) != str(c[k])
+                          for k in addr_keys)
+            clear = False
+            if changed and os.path.isdir(EPG_DIR):
+                clear = messagebox.askyesno(
+                    "下载参数已改变",
+                    "地址或频道表已改变，旧的 EPG 可能属于其他地区。\n"
+                    "是否清空已下载的 EPG 并重新下载？", parent=win)
+            self.cfg.update(c)
+            self.save_config()
+            if clear:
+                epg_clear_all()
+            self.refresh_slots()
+            win.destroy()
+            if download or clear:
+                self.start_epg_update(silent=not download)
+
+        def reset():
+            for k, v in vars_.items():
+                v.set(str(DEFAULT_CONFIG[k]))
+
+        bf = ttk.Frame(win, style="Panel.TFrame")
+        bf.grid(row=r + 2, column=0, columnspan=3, pady=10)
+        ttk.Button(bf, text="恢复默认", command=reset).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="保存", command=lambda: save(False)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="保存并下载", command=lambda: save(True)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=6)
+
+        win.grab_set()
+        center_window(win, self)
+
+    def start_epg_update(self, silent):
+        st = self.epg_state
+        if st and not st["finished"]:
+            if not silent:
+                messagebox.showinfo("提示", "EPG 正在更新中，请稍候。")
+            return
+        today = self.local_now().date()
+        n = max(1, int(self.cfg["replay_days"]))
+        force = set() if silent else {today.strftime("%Y%m%d")}
+        try:
+            threads = max(1, min(10, int(self.cfg.get("epg_threads", EPG_THREADS))))
+            timeout = max(3, min(10, int(self.cfg.get("epg_timeout", EPG_TIMEOUT))))
+        except (TypeError, ValueError):
+            threads, timeout = EPG_THREADS, EPG_TIMEOUT
+        self.epg_state = {"total": 0, "done": 0, "ok": 0, "fail": 0, "nodata": 0,
+                          "removed": 0, "error": None, "finished": False,
+                          "cancel": False, "silent": silent,
+                          "csv": epg_csv_path(self.cfg), "threads": threads,
+                          "timeout": timeout, "url_fn": _epg_url_fn(self.cfg)}
+        threading.Thread(target=epg_update_worker,
+                         args=(self.epg_state, today, n, force),
+                         daemon=True).start()
+        if not silent:
+            self.status_var.set("正在更新 EPG…")
+        self.after(500, self._poll_epg)
+
+    def _poll_epg(self):
+        st = self.epg_state
+        if st is None:
+            return
+        if not st["finished"]:
+            if not st["silent"] and st["total"]:
+                self.status_var.set("正在更新 EPG… %d / %d" % (st["done"], st["total"]))
+            self.after(500, self._poll_epg)
+            return
+
+        changed = st["ok"] > 0 or st["removed"] > 0
+        if changed:
+            self._refresh_slots_keep_selection()
+        summary = "EPG 更新完成：新增 %d，无数据 %d，失败 %d，清理过期 %d" % (
+            st["ok"], st["nodata"], st["fail"], st["removed"])
+
+        if st["silent"]:
+            # 静默模式：不弹窗；正在播放时不覆盖状态栏
+            if not st["error"] and changed and not self.current_url:
+                self.status_var.set(summary)
+        elif st["error"]:
+            self.status_var.set("EPG 更新失败：" + st["error"])
+            messagebox.showwarning("EPG 更新失败", st["error"])
+        else:
+            self.status_var.set(summary)
+            messagebox.showinfo("EPG 下载", summary)
+
+    def _refresh_slots_keep_selection(self):
+        keep = None
+        sel = self.slot_list.curselection()
+        if sel and sel[0] < len(self.slot_items):
+            keep = self.slot_items[sel[0]]
+        self.refresh_slots()
+        if keep is not None and not self._slots_locked and keep in self.slot_items:
+            i = self.slot_items.index(keep)
+            self.slot_list.selection_set(i)
+            self.slot_list.see(i)
+
+    def _on_date_selected(self, event=None):
+        try:
+            self.date_cb.selection_clear()
+        except Exception:
+            pass
+        self.refresh_slots()
+
+    def _step_date(self, delta):
+        vals = self.date_cb["values"]
+        if not vals:
+            return "break"
+        i = max(0, min(len(vals) - 1, self.date_cb.current() + delta))
+        if i != self.date_cb.current():
+            self.date_cb.current(i)
+            self._on_date_selected()
+        return "break"
+
     def refresh_slots(self):
         self.slot_list.delete(0, tk.END)
+        self.slot_items = []
         day = self.selected_date()
         now = self.local_now()
+        ch = self.selected_channel()
         self._slots_locked = (self._replay_allowed() is False)
-        for h in range(24):
-            raw = "%02d:00 - %s" % (
-                h, "24:00" if h == 23 else "%02d:00" % (h + 1))
-            label = "     " + raw
-            self.slot_list.insert(tk.END, label)
-            if self._slots_locked or (day and day + timedelta(hours=h) >= now):
-                self.slot_list.itemconfig(h, fg=COLORS["disabled_fg"])
+        if day is None:
+            return
+
+        slots, from_epg = self.build_day_slots(ch, day.date())
+        cur_idx = None
+        for i, (label, s, e) in enumerate(slots):
+            self.slot_list.insert(tk.END, "  " + label)
+            self.slot_items.append((s, e))
+            is_current = (s <= now < e)
+            if self._slots_locked or s >= now:
+                self.slot_list.itemconfig(i, fg=COLORS["disabled_fg"])
+            elif is_current:
+                self.slot_list.itemconfig(i, fg=COLORS["live_green"])
+            if cur_idx is None and is_current:
+                cur_idx = i
+
+        if ch is None or self._slots_locked:
+            self.epg_var.set("")
+        elif from_epg:
+            self.epg_var.set("节目单：EPG（%d 个节目）" % len(slots))
+        else:
+            self.epg_var.set("无 EPG 数据，按整点时段显示")
+
         if self._slots_locked:
             self.slot_list.selection_clear(0, tk.END)
             try:
@@ -1213,18 +1961,16 @@ class IPTVApp(tk.Tk):
                 self.slot_list.configure(cursor="hand2")
             except Exception:
                 pass
+            if cur_idx is not None:
+                self.slot_list.see(cur_idx)
 
     def selected_slot(self):
         if self._slots_locked or self._replay_allowed() is False:
             return None
         sel = self.slot_list.curselection()
-        day = self.selected_date()
-        if not sel or day is None:
+        if not sel or sel[0] >= len(self.slot_items):
             return None
-        h = sel[0]
-        start = day + timedelta(hours=h)
-        end = start + timedelta(hours=1)
-        return start, end
+        return self.slot_items[sel[0]]
 
     def load_default(self):
         if os.path.exists(DEFAULT_M3U):
@@ -1497,6 +2243,7 @@ class IPTVApp(tk.Tk):
         self._clear_replay_range()
         self.current = ch
         self.play_url(ch["url"], "[直播] " + ch["name"])
+        self._refresh_live_bar()
 
     def replay_url_for_selection(self):
         ch = self.selected_channel() or self.current
@@ -1514,7 +2261,16 @@ class IPTVApp(tk.Tk):
         return ch, start, end, build_replay_url(ch["url"], start, end, self.cfg)
 
     def _play_replay_at(self, ch, start, end):
-        if start >= self.local_now():
+        now = self.local_now()
+        if start <= now < end:
+            self._clear_replay_range()
+            self.current = ch
+            self.play_url(ch["url"], "[直播] " + ch["name"], live=True)
+            self._refresh_live_bar()
+            self.status_var.set("当前时段为直播：%s" % ch["name"])
+            return
+
+        if start >= now:
             messagebox.showwarning("提示", "所选时间段尚未开始，无法回看")
             return
         if start.date() < self.earliest_date():
@@ -1586,6 +2342,8 @@ class IPTVApp(tk.Tk):
             self.player.stop()
         self.kill_external()
         self._clear_replay_range()
+        self.current = None
+        self.current_url = ""
         self.time_var.set("--:--:-- / --:--:--")
         self.status_var.set("已停止")
 
@@ -1595,30 +2353,30 @@ class IPTVApp(tk.Tk):
             self.player.audio_set_volume(v)
         self.cfg["volume"] = v
 
+    def _apply_left_width(self):
+        self.left_panel.grid_propagate(False)
+        self.left_panel.pack_propagate(False)
+        if self.left_visible:
+            self.left_panel.configure(
+                width=max(150, min(600, int(self.cfg.get("left_width", 250)))))
+            return
+        self.update_idletasks()
+        w = 20
+        src = self.right_btn_col if self.right_btn_col is not None else self.left_btn_col
+        if src is not None:
+            rw = src.winfo_reqwidth()
+            if rw > 0:
+                w = rw
+        self.left_panel.configure(width=w)
+
     def _apply_left_visible(self):
         if self.left_visible:
             self.left_body.grid(row=0, column=0, sticky="nsew")
             self.left_btn.config(text="◀")
-            self.left_panel.grid_propagate(False)
-            self.left_panel.pack_propagate(False)
-            w = max(150, min(600, int(self.cfg.get("left_width", 250))))
-            self.left_panel.configure(width=w)
         else:
             self.left_body.grid_remove()
             self.left_btn.config(text="▶")
-            self.left_panel.grid_propagate(False)
-            self.left_panel.pack_propagate(False)
-            self.update_idletasks()
-            w = 20
-            if self.right_btn_col is not None:
-                rw = self.right_btn_col.winfo_reqwidth()
-                if rw > 0:
-                    w = rw
-            elif self.left_btn_col is not None:
-                lw = self.left_btn_col.winfo_reqwidth()
-                if lw > 0:
-                    w = lw
-            self.left_panel.configure(width=w)
+        self._apply_left_width()
 
     def _apply_right_visible(self):
         if self.right_visible:
@@ -1688,21 +2446,9 @@ class IPTVApp(tk.Tk):
         self.left_panel.grid_columnconfigure(0, weight=1)
         if self.left_visible:
             self.left_body.grid(row=0, column=0, sticky="nsew")
-            self.left_panel.grid_propagate(False)
-            self.left_panel.pack_propagate(False)
-            w = max(150, min(600, int(self.cfg.get("left_width", 250))))
-            self.left_panel.configure(width=w)
         else:
             self.left_body.grid_remove()
-            self.left_panel.grid_propagate(False)
-            self.left_panel.pack_propagate(False)
-            self.update_idletasks()
-            w = 20
-            if self.right_btn_col is not None:
-                rw = self.right_btn_col.winfo_reqwidth()
-                if rw > 0:
-                    w = rw
-            self.left_panel.configure(width=w)
+        self._apply_left_width()
 
         self.right_panel.grid(row=0, column=2, sticky="ns")
         self.right_panel.grid_rowconfigure(0, weight=1)
@@ -1725,7 +2471,6 @@ class IPTVApp(tk.Tk):
         win.configure(bg=COLORS["bg_panel"])
         win.transient(self)
         win.resizable(False, False)
-        win.grab_set()
 
         rows = [("userid", "userid"), ("AuthInfo", "authinfo"),
                 ("时区偏移(小时, 重庆=8)", "tz_offset"), ("可回看天数(含今天)", "replay_days"),
@@ -1770,6 +2515,7 @@ class IPTVApp(tk.Tk):
             self.date_cb["values"] = self.date_choices()
             self.date_cb.current(0)
             self.refresh_slots()
+            self.start_epg_update(silent=True)
             win.destroy()
 
         bf = ttk.Frame(win, style="Panel.TFrame")
@@ -1777,7 +2523,13 @@ class IPTVApp(tk.Tk):
         ttk.Button(bf, text="确定", command=ok).pack(side=tk.LEFT, padx=8)
         ttk.Button(bf, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=8)
 
+        win.grab_set()
+        center_window(win, self)
+
     def on_close(self):
+        if self.epg_state:
+            self.epg_state["cancel"] = True
+
         if self._progress_after_id:
             try:
                 self.after_cancel(self._progress_after_id)
