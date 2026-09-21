@@ -1,20 +1,48 @@
-name: Build APK
+name: Build Android APK
+
 on:
   workflow_dispatch:
+
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Calculate version number
+        run: echo "VER=$(TZ=Asia/Shanghai date +%y.%m.%d)" >> "$GITHUB_ENV"
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
-      - run: gradle assembleRelease --no-daemon
+
+      - name: Build APK
+        run: gradle assembleRelease --no-daemon -PbuildDate=${{ env.VER }}
+
       - uses: actions/upload-artifact@v4
         with:
-          name: IPTV-Player-TV-apk
+          name: IPTV-Player-v${{ env.VER }}
           path: app/build/outputs/apk/release/*.apk
+
+      - name: upload Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="v${VER}"
+          APK="app/build/outputs/apk/release/IPTV Player ${TAG}.apk"
+          test -f "$APK"
+          # 同一天重复编译：先删掉旧的 Release 和 tag，再按本次提交重新创建
+          gh release delete "$TAG" --cleanup-tag --yes || true
+          gh release create "$TAG" "${APK}#IPTV Player ${TAG}.apk" \
+            --target "$GITHUB_SHA" \
+            --title "IPTV Player ${TAG}" \
+            --notes "编译日期 20${VER//./-}（北京时间），提交 ${GITHUB_SHA::7}"
