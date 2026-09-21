@@ -1,0 +1,79 @@
+name: Build IPTV Player EXE (Nuitka + MSVC)
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: |
+          pip install nuitka python-vlc ordered-set zstandard
+
+      - name: Detect version from entry file
+        id: version
+        shell: pwsh
+        run: |
+          $file = Get-ChildItem -Filter "IPTV Player v*.pyw" | Select-Object -First 1
+          if (-not $file) {
+            throw "未找到匹配 'IPTV Player v*.pyw' 的入口文件，请检查仓库根目录"
+          }
+          if ($file.Name -notmatch "IPTV Player v([\d.]+)\.pyw") {
+            throw "无法从文件名 '$($file.Name)' 中解析出版本号"
+          }
+          $version = $matches[1]
+          Write-Host "检测到入口文件: $($file.Name)"
+          Write-Host "检测到版本号: $version"
+          echo "APP_VERSION=$version" >> $env:GITHUB_ENV
+          echo "ENTRY_FILE=$($file.Name)" >> $env:GITHUB_ENV
+
+      - name: Build EXE with Nuitka (MSVC)
+        shell: pwsh
+        run: |
+          python -m nuitka --standalone --windows-console-mode=disable --enable-plugin=tk-inter --include-module=vlc --include-data-dir=src=src --nofollow-import-to=unittest --nofollow-import-to=test --nofollow-import-to=pydoc --noinclude-pytest-mode=nofollow --noinclude-setuptools-mode=nofollow --python-flag=no_docstrings --msvc=latest --lto=yes --assume-yes-for-downloads --remove-output --output-dir=dist --output-filename="IPTV Player v$env:APP_VERSION.exe" "$env:ENTRY_FILE"
+
+      - name: Bundle vlc_module
+        shell: pwsh
+        run: |
+          # Nuitka 的 --include-data-dir 不会复制 dll，所以 vlc_module 在编译后整体拷贝到 dist 目录
+          if (-not (Test-Path "vlc_module/libvlc.dll")) {
+            throw "未找到 vlc_module/libvlc.dll，请检查仓库中的 vlc_module 目录"
+          }
+          $dist = Get-ChildItem -Path dist -Directory -Filter "*.dist" | Select-Object -First 1
+          if (-not $dist) {
+            throw "未找到 Nuitka 生成的 .dist 目录"
+          }
+          Copy-Item -Path "vlc_module" -Destination (Join-Path $dist.FullName "vlc_module") -Recurse -Force
+          echo "DIST_DIR=$($dist.FullName)" >> $env:GITHUB_ENV
+
+      - name: Package to ZIP
+        shell: pwsh
+        run: |
+          $releaseDir = "IPTV Player v$env:APP_VERSION"
+          Rename-Item -Path $env:DIST_DIR -NewName $releaseDir
+          $zipName = "$releaseDir.zip"
+          Compress-Archive -Path "dist/$releaseDir" -DestinationPath $zipName
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.APP_VERSION }}
+          name: v${{ env.APP_VERSION }}
+          files: IPTV*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
