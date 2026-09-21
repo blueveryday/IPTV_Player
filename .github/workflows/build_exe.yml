@@ -44,7 +44,7 @@ jobs:
       - name: Build EXE with Nuitka (MSVC)
         shell: pwsh
         run: |
-          python -m nuitka --standalone --windows-console-mode=disable --enable-plugin=tk-inter --include-module=vlc --include-data-dir=src=src --nofollow-import-to=unittest --nofollow-import-to=test --nofollow-import-to=pydoc --noinclude-pytest-mode=nofollow --noinclude-setuptools-mode=nofollow --python-flag=no_docstrings --msvc=latest --lto=yes --assume-yes-for-downloads --remove-output --output-dir=dist --output-filename="IPTV Player v$env:APP_VERSION.exe" "$env:ENTRY_FILE"
+          python -m nuitka --standalone --windows-console-mode=disable --enable-plugin=tk-inter --include-module=vlc --include-data-dir=src=src --nofollow-import-to=unittest --nofollow-import-to=test --nofollow-import-to=pydoc --nofollow-import-to=cgi --nofollow-import-to=cgitb --nofollow-import-to=chunk --nofollow-import-to=colorsys --nofollow-import-to=configparser --nofollow-import-to=crypt --nofollow-import-to=filecmp --nofollow-import-to=fileinput --nofollow-import-to=graphlib --nofollow-import-to=html.parser --nofollow-import-to=_markupbase --nofollow-import-to=imaplib --nofollow-import-to=imghdr --nofollow-import-to=mailcap --nofollow-import-to=modulefinder --nofollow-import-to=pickletools --nofollow-import-to=pipes --nofollow-import-to=poplib --nofollow-import-to=pstats --nofollow-import-to=pyclbr --nofollow-import-to=sched --nofollow-import-to=sndhdr --nofollow-import-to=sre_compile --nofollow-import-to=sre_constants --nofollow-import-to=sre_parse --nofollow-import-to=stringprep --nofollow-import-to=symtable --nofollow-import-to=timeit --nofollow-import-to=tomllib --nofollow-import-to=trace --nofollow-import-to=uu --nofollow-import-to=xdrlib --nofollow-import-to=_pyio --nofollow-import-to=importlib.simple --nofollow-import-to=importlib.resources.simple --noinclude-pytest-mode=nofollow --noinclude-setuptools-mode=nofollow --python-flag=no_docstrings --msvc=latest --lto=yes --assume-yes-for-downloads --remove-output --output-dir=dist --output-filename="IPTV Player v$env:APP_VERSION.exe" "$env:ENTRY_FILE"
 
       - name: Bundle vlc_module
         shell: pwsh
@@ -57,8 +57,39 @@ jobs:
           if (-not $dist) {
             throw "未找到 Nuitka 生成的 .dist 目录"
           }
-          Copy-Item -Path "vlc_module" -Destination (Join-Path $dist.FullName "vlc_module") -Recurse -Force
+          $vlc = Join-Path $dist.FullName "vlc_module"
+          Copy-Item -Path "vlc_module" -Destination $vlc -Recurse -Force
+
+          # 删除 IPTV 播放用不到的 VLC 组件（界面、转码/推流、可视化、编码器等，约 44 MB）
+          $dropDirs = "gui","access_output","stream_out","mux","visualization","services_discovery","lua","meta_engine"
+          foreach ($d in $dropDirs) {
+            Remove-Item -Recurse -Force (Join-Path $vlc "plugins/$d") -ErrorAction SilentlyContinue
+          }
+          $dropFiles = "axvlc.dll","npvlc.dll","plugins/codec/libx264_plugin.dll","plugins/codec/libx26410b_plugin.dll","plugins/codec/libx265_plugin.dll"
+          foreach ($f in $dropFiles) {
+            Remove-Item -Force (Join-Path $vlc $f) -ErrorAction SilentlyContinue
+          }
+
+          # 确认播放必需的组件都还在
+          $must = "libvlc.dll","libvlccore.dll","plugins/access/libhttp_plugin.dll","plugins/access/libhttps_plugin.dll","plugins/access/liblive555_plugin.dll","plugins/codec/libavcodec_plugin.dll","plugins/demux/libts_plugin.dll","plugins/video_output/libdirect3d11_plugin.dll","plugins/audio_output/libmmdevice_plugin.dll"
+          foreach ($f in $must) {
+            if (-not (Test-Path (Join-Path $vlc $f))) { throw "缺少必需的 VLC 组件: $f" }
+          }
+          $mb = [math]::Round((Get-ChildItem $vlc -Recurse -File | Measure-Object Length -Sum).Sum / 1MB, 1)
+          Write-Host "vlc_module 精简后大小: $mb MB"
           echo "DIST_DIR=$($dist.FullName)" >> $env:GITHUB_ENV
+
+      - name: Smoke test (启动 10 秒，确认没有闪退)
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:DIST_DIR "IPTV Player v$env:APP_VERSION.exe"
+          $p = Start-Process -FilePath $exe -WorkingDirectory $env:DIST_DIR -PassThru
+          Start-Sleep -Seconds 10
+          if ($p.HasExited) {
+            throw "程序启动后立即退出（退出码 $($p.ExitCode)），可能缺少模块或文件"
+          }
+          Write-Host "程序运行正常，结束进程"
+          Stop-Process -Id $p.Id -Force
 
       - name: Package to ZIP
         shell: pwsh
