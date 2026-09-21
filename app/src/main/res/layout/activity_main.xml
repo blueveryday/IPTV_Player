@@ -88,7 +88,7 @@
 
     <LinearLayout
         android:id="@+id/leftPanel"
-        android:layout_width="340dp"
+        android:layout_width="260dp"
         android:layout_height="match_parent"
         android:background="@drawable/panel_bg"
         android:clickable="true"
@@ -176,7 +176,7 @@
 
     <LinearLayout
         android:id="@+id/rightPanel"
-        android:layout_width="400dp"
+        android:layout_width="320dp"
         android:layout_height="match_parent"
         android:layout_gravity="end"
         android:background="@drawable/panel_bg"

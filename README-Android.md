@@ -6,13 +6,13 @@
 ### 方式 A：GitHub 在线编译（无需装任何软件）
 1. 把本文件夹全部内容推到你的 GitHub 仓库（含 `.github/workflows/build.yml`）。
 2. 仓库 → Actions → Build APK → Run workflow。
-3. 完成后在 Artifacts 下载 `IPTV-Player-TV-apk`，里面就是 `app-release.apk`。
+3. 完成后在 Artifacts 下载 `IPTV-Player-TV-apk`，里面就是 `IPTV Player v26.09.21.apk`（版本号 = 编译日期，北京时间；软件内“菜单”标题和“关于”里也能看到）。
 
 ### 方式 B：Android Studio
 用 Android Studio（Koala 及以上，JDK 17）打开本文件夹 → 等待 Gradle 同步 → Build > Build APK(s)。
 
 ## 安装到电视
-- U 盘拷贝安装，或 `adb connect 电视IP` 后 `adb install app-release.apk`。
+- U 盘拷贝安装，或 `adb connect 电视IP` 后 `adb install "IPTV Player v26.09.21.apk"`。
 
 ## 准备数据
 - 频道：菜单 → 打开 m3u 文件 / 从网址加载 m3u；或 `adb push iptv.m3u /sdcard/Android/data/com.iptv.tv/files/`；或放入 `app/src/main/assets/` 后编译。

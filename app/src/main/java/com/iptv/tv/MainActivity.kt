@@ -54,7 +54,6 @@ data class SlotItem(val label: String, val start: LocalDateTime, val end: LocalD
 class MainActivity : AppCompatActivity() {
 
     companion object {
-        const val CODE_VERSION = "IPTV Player TV v2026.09.21（移植自 v2026.09.20）"
         const val GITHUB_URL = "https://github.com/blueveryday/IPTV_Player"
         const val SEEK = 5                       // 与原版 SEEK_GRANULARITY 相同
         const val WEEKDAY = "一二三四五六日"
@@ -193,6 +192,8 @@ class MainActivity : AppCompatActivity() {
         btnMenu.setOnClickListener { showMenu() }
         btnReplay.setOnClickListener { playReplay() }
         btnCopy.setOnClickListener { copyReplayUrl() }
+        findViewById<View>(R.id.btnEpg).setOnClickListener { showRight() }
+        findViewById<View>(R.id.btnBack).setOnClickListener { showLeft() }
         dateBtn.setOnClickListener { chooseDate() }
         updateDateBtn()
         setupGestures()
@@ -447,6 +448,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showRight() {
+        if (selIdx !in filtered.indices) {
+            val c = current
+            val i = if (c != null) filtered.indexOfFirst { it.url == c.url } else -1
+            if (i >= 0) { selIdx = i; chAdapter.setSelectedPos(i); onChannelSelect() }
+        }
         leftPanel.visibility = View.GONE
         rightPanel.visibility = View.VISIBLE
         refreshSlots()
@@ -1068,7 +1074,7 @@ class MainActivity : AppCompatActivity() {
             "回看参数设置…", "播放选项（硬解 / RTSP-TCP）…",
             "下载 EPG", "自定义 EPG 下载参数…",
             "关于", "退出程序")
-        AlertDialog.Builder(this).setTitle("菜单").setItems(items) { _, w ->
+        AlertDialog.Builder(this).setTitle("菜单　${versionText()}").setItems(items) { _, w ->
             when (w) {
                 0 -> { hidePanels(); playLive() }
                 1 -> togglePause()
@@ -1088,8 +1094,13 @@ class MainActivity : AppCompatActivity() {
         }.show()
     }
 
+    private fun versionText(): String {
+        val v = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { null }
+        return "IPTV Player v${v ?: "?"}"
+    }
+
     private fun showAbout() {
-        alert("关于", "$CODE_VERSION\n\nGitHub：$GITHUB_URL\n\n" +
+        alert("关于", "${versionText()}\n\nGitHub：$GITHUB_URL\n\n" +
                 "遥控器：\n确定键=频道列表（长按=菜单）\n上/下=换台　左/右=倒退/快进（5 秒）\n" +
                 "频道列表中 → 进入回看节目单，← 返回\n菜单键=菜单　返回键=关闭面板\n\n" +
                 "触屏：\n左半屏上下滑=亮度　右半屏上下滑=音量\n左边缘右滑=频道菜单　右边缘左滑=回看菜单\n单击=进度条/关闭面板　长按=主菜单")

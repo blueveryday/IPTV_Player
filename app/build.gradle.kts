@@ -1,3 +1,11 @@
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+
+// 版本号 = 编译日期（北京时间），如 2026-09-21 编译 => 26.09.21
+val buildDate: String = LocalDate.now(ZoneId.of("Asia/Shanghai"))
+    .format(DateTimeFormatter.ofPattern("yy.MM.dd"))
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -11,8 +19,8 @@ android {
         applicationId = "com.iptv.tv"
         minSdk = 21
         targetSdk = 34
-        versionCode = 1
-        versionName = "2026.09.21"
+        versionCode = buildDate.replace(".", "").toInt()   // 26.09.21 -> 260921，随日期递增
+        versionName = buildDate
         ndk { abiFilters += listOf("armeabi-v7a", "arm64-v8a") }
     }
 
@@ -29,6 +37,14 @@ android {
         isCoreLibraryDesugaringEnabled = true
     }
     kotlinOptions { jvmTarget = "17" }
+
+    // APK 文件名：IPTV Player v26.09.21.apk
+    applicationVariants.all {
+        outputs.all {
+            (this as com.android.build.gradle.internal.api.BaseVariantOutputImpl).outputFileName =
+                "IPTV Player v$buildDate.apk"
+        }
+    }
 }
 
 dependencies {
