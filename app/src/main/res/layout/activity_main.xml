@@ -9,6 +9,13 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
+    <!-- 触屏手势层：盖在视频上、面板和进度条之下 -->
+    <View
+        android:id="@+id/touchLayer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:focusable="false" />
+
     <LinearLayout
         android:id="@+id/bottomBar"
         android:layout_width="match_parent"
@@ -65,11 +72,27 @@
             android:textSize="16sp" />
     </LinearLayout>
 
+    <TextView
+        android:id="@+id/gestureHint"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:background="@drawable/bar_bg"
+        android:paddingStart="24dp"
+        android:paddingTop="12dp"
+        android:paddingEnd="24dp"
+        android:paddingBottom="12dp"
+        android:textColor="#ffffff"
+        android:textSize="22sp"
+        android:visibility="gone" />
+
     <LinearLayout
         android:id="@+id/leftPanel"
         android:layout_width="340dp"
         android:layout_height="match_parent"
         android:background="@drawable/panel_bg"
+        android:clickable="true"
+        android:focusable="false"
         android:orientation="vertical"
         android:padding="10dp"
         android:visibility="gone">
@@ -157,6 +180,8 @@
         android:layout_height="match_parent"
         android:layout_gravity="end"
         android:background="@drawable/panel_bg"
+        android:clickable="true"
+        android:focusable="false"
         android:orientation="vertical"
         android:padding="10dp"
         android:visibility="gone">

@@ -1,25 +1,32 @@
 package com.iptv.tv
 
+import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Color
+import android.graphics.Rect
+import android.media.AudioManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.text.Editable
 import android.text.InputType
 import android.text.TextWatcher
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.widget.*
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -37,8 +44,10 @@ import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 data class SlotItem(val label: String, val start: LocalDateTime, val end: LocalDateTime, val color: Int)
 
@@ -60,6 +69,8 @@ class MainActivity : AppCompatActivity() {
 
     // views
     private lateinit var videoLayout: VLCVideoLayout
+    private lateinit var touchLayer: View
+    private lateinit var gestureHint: TextView
     private lateinit var bottomBar: View
     private lateinit var titleText: TextView
     private lateinit var seekBar: SeekBarView
@@ -129,6 +140,8 @@ class MainActivity : AppCompatActivity() {
         ensureDefaultCsv()
 
         videoLayout = findViewById(R.id.videoLayout)
+        touchLayer = findViewById(R.id.touchLayer)
+        gestureHint = findViewById(R.id.gestureHint)
         bottomBar = findViewById(R.id.bottomBar)
         titleText = findViewById(R.id.titleText)
         seekBar = findViewById(R.id.seekBar)
@@ -165,6 +178,7 @@ class MainActivity : AppCompatActivity() {
         btnCopy.setOnClickListener { copyReplayUrl() }
         dateBtn.setOnClickListener { chooseDate() }
         updateDateBtn()
+        setupGestures()
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
@@ -224,6 +238,117 @@ class MainActivity : AppCompatActivity() {
         cfg.save()
         try { player?.stop(); player?.detachViews(); player?.release(); libVlc?.release() } catch (_: Exception) {}
         super.onDestroy()
+    }
+
+    // ================= 触屏手势 =================
+    // 左半屏上下滑=亮度　右半屏上下滑=音量
+    // 左边缘向右滑=频道菜单　右边缘向左滑=回看菜单
+    // 单击=显示进度条/关闭面板　长按=主菜单
+
+    private var gMode = 0        // 0 未定  1 亮度  2 音量  3 左边缘  4 右边缘  5 忽略
+    private var gDownX = 0f
+    private var gDownY = 0f
+    private var gStartVal = 0f
+    private var gFired = false
+    private var gLongFired = false
+    private var gEdgeL = false
+    private var gEdgeR = false
+    private val longPressRunnable = Runnable { gLongFired = true; gMode = 5; showMenu() }
+    private val hideHintRunnable = Runnable { gestureHint.visibility = View.GONE }
+    private val audioMgr by lazy { getSystemService(Context.AUDIO_SERVICE) as AudioManager }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun setupGestures() {
+        val slop = ViewConfiguration.get(this).scaledTouchSlop
+        val edgeW = dp(32)
+        val swipeMin = dp(48)
+
+        // 全面屏的系统返回手势会抢走屏幕边缘的滑动：把两侧边缘（中间一段）划出来留给本 App
+        touchLayer.addOnLayoutChangeListener { v, l, t, r, b, _, _, _, _ ->
+            val w = r - l
+            val h = b - t
+            val bandH = min(h, dp(200))
+            val y0 = (h - bandH) / 2
+            ViewCompat.setSystemGestureExclusionRects(v, listOf(
+                Rect(0, y0, edgeW * 2, y0 + bandH),
+                Rect(w - edgeW * 2, y0, w, y0 + bandH)))
+        }
+
+        touchLayer.setOnTouchListener { v, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    gDownX = e.x; gDownY = e.y
+                    gMode = 0; gFired = false; gLongFired = false
+                    gEdgeL = e.x <= edgeW
+                    gEdgeR = e.x >= v.width - edgeW
+                    ui.removeCallbacks(longPressRunnable)
+                    ui.postDelayed(longPressRunnable, ViewConfiguration.getLongPressTimeout().toLong())
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = e.x - gDownX
+                    val dy = e.y - gDownY
+                    if (gMode == 0 && (abs(dx) > slop || abs(dy) > slop)) {
+                        ui.removeCallbacks(longPressRunnable)
+                        gMode = if (abs(dy) > abs(dx)) {
+                            if (gDownX < v.width / 2f) { gStartVal = currentBrightness(); 1 }
+                            else { gStartVal = currentVolume().toFloat(); 2 }
+                        } else when {
+                            gEdgeL && dx > 0 -> 3
+                            gEdgeR && dx < 0 -> 4
+                            else -> 5
+                        }
+                    }
+                    when (gMode) {
+                        1 -> setBrightness(gStartVal - dy / v.height)
+                        2 -> setVolume(gStartVal - dy / v.height * maxVolume())
+                        3 -> if (!gFired && dx >= swipeMin) { gFired = true; showLeft() }
+                        4 -> if (!gFired && -dx >= swipeMin) { gFired = true; showRight() }
+                    }
+                }
+                MotionEvent.ACTION_UP -> {
+                    ui.removeCallbacks(longPressRunnable)
+                    if (gMode == 0 && !gLongFired) {
+                        if (panelsVisible()) hidePanels() else showBar()
+                    }
+                }
+                MotionEvent.ACTION_CANCEL -> ui.removeCallbacks(longPressRunnable)
+            }
+            true
+        }
+    }
+
+    private fun showHint(s: String) {
+        gestureHint.text = s
+        gestureHint.visibility = View.VISIBLE
+        ui.removeCallbacks(hideHintRunnable)
+        ui.postDelayed(hideHintRunnable, 800)
+    }
+
+    private fun currentBrightness(): Float {
+        val b = window.attributes.screenBrightness
+        if (b >= 0f) return b
+        return try {
+            (Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS) / 255f).coerceIn(0.01f, 1f)
+        } catch (_: Exception) { 0.5f }
+    }
+
+    private fun setBrightness(v: Float) {
+        val b = v.coerceIn(0.01f, 1f)
+        val lp = window.attributes
+        lp.screenBrightness = b
+        window.attributes = lp
+        showHint("亮度 ${(b * 100).roundToInt()}%")
+    }
+
+    private fun maxVolume(): Int = audioMgr.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+    private fun currentVolume(): Int = audioMgr.getStreamVolume(AudioManager.STREAM_MUSIC)
+
+    private fun setVolume(v: Float) {
+        val max = maxVolume()
+        if (max <= 0) return
+        val vol = v.roundToInt().coerceIn(0, max)
+        audioMgr.setStreamVolume(AudioManager.STREAM_MUSIC, vol, 0)
+        showHint("音量 ${vol * 100 / max}%")
     }
 
     // ================= 遥控器按键 =================
@@ -942,7 +1067,8 @@ class MainActivity : AppCompatActivity() {
     private fun showAbout() {
         alert("关于", "$CODE_VERSION\n\nGitHub：$GITHUB_URL\n\n" +
                 "遥控器：\n确定键=频道列表（长按=菜单）\n上/下=换台　左/右=倒退/快进（5 秒）\n" +
-                "频道列表中 → 进入回看节目单，← 返回\n菜单键=菜单　返回键=关闭面板")
+                "频道列表中 → 进入回看节目单，← 返回\n菜单键=菜单　返回键=关闭面板\n\n" +
+                "触屏：\n左半屏上下滑=亮度　右半屏上下滑=音量\n左边缘右滑=频道菜单　右边缘左滑=回看菜单\n单击=进度条/关闭面板　长按=主菜单")
     }
 
     private fun openPlayOptions() {
