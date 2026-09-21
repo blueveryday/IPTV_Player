@@ -28,23 +28,25 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $file = Get-ChildItem -Filter "IPTV Player v*.pyw" | Select-Object -First 1
+          $file = Get-Item -LiteralPath "IPTV Player.pyw" -ErrorAction SilentlyContinue
           if (-not $file) {
-            throw "未找到匹配 'IPTV Player v*.pyw' 的入口文件，请检查仓库根目录"
+            throw "未找到入口文件 'IPTV Player.pyw'，请检查仓库根目录"
           }
-          if ($file.Name -notmatch "IPTV Player v([\d.]+)\.pyw") {
-            throw "无法从文件名 '$($file.Name)' 中解析出版本号"
+          $text = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8
+          if ($text -match 'CODE_VERSION\s*=\s*["''][^"'']*?v(\d+(?:\.\d+)*)["'']') {
+            $version = $matches[1]
+          } else {
+            throw "未能从 'IPTV Player.pyw' 中解析出 CODE_VERSION 里的版本号"
           }
-          $version = $matches[1]
-          Write-Host "检测到入口文件: $($file.Name)"
-          Write-Host "检测到版本号: $version"
+          Write-Host "入口文件: $($file.Name)"
+          Write-Host "版本号: $version"
           echo "APP_VERSION=$version" >> $env:GITHUB_ENV
           echo "ENTRY_FILE=$($file.Name)" >> $env:GITHUB_ENV
 
       - name: Build EXE with Nuitka (MSVC)
         shell: pwsh
         run: |
-          python -m nuitka --standalone --windows-console-mode=disable --enable-plugin=tk-inter --include-module=vlc --include-data-dir=src=src --nofollow-import-to=unittest --nofollow-import-to=test --nofollow-import-to=pydoc --nofollow-import-to=cgi --nofollow-import-to=cgitb --nofollow-import-to=chunk --nofollow-import-to=colorsys --nofollow-import-to=configparser --nofollow-import-to=crypt --nofollow-import-to=filecmp --nofollow-import-to=fileinput --nofollow-import-to=graphlib --nofollow-import-to=html.parser --nofollow-import-to=_markupbase --nofollow-import-to=imaplib --nofollow-import-to=imghdr --nofollow-import-to=mailcap --nofollow-import-to=modulefinder --nofollow-import-to=pickletools --nofollow-import-to=pipes --nofollow-import-to=poplib --nofollow-import-to=pstats --nofollow-import-to=pyclbr --nofollow-import-to=sched --nofollow-import-to=sndhdr --nofollow-import-to=sre_compile --nofollow-import-to=sre_constants --nofollow-import-to=sre_parse --nofollow-import-to=stringprep --nofollow-import-to=symtable --nofollow-import-to=timeit --nofollow-import-to=tomllib --nofollow-import-to=trace --nofollow-import-to=uu --nofollow-import-to=xdrlib --nofollow-import-to=_pyio --nofollow-import-to=importlib.simple --nofollow-import-to=importlib.resources.simple --noinclude-pytest-mode=nofollow --noinclude-setuptools-mode=nofollow --python-flag=no_docstrings --msvc=latest --lto=yes --assume-yes-for-downloads --remove-output --output-dir=dist --output-filename="IPTV Player v$env:APP_VERSION.exe" "$env:ENTRY_FILE"
+          python -m nuitka --standalone --windows-console-mode=disable --windows-icon-from-ico=src/asset/iptv.ico --enable-plugin=tk-inter --include-module=vlc --include-data-dir=src=src --nofollow-import-to=unittest --nofollow-import-to=test --nofollow-import-to=pydoc --nofollow-import-to=cgi --nofollow-import-to=cgitb --nofollow-import-to=chunk --nofollow-import-to=colorsys --nofollow-import-to=configparser --nofollow-import-to=crypt --nofollow-import-to=filecmp --nofollow-import-to=fileinput --nofollow-import-to=graphlib --nofollow-import-to=html.parser --nofollow-import-to=_markupbase --nofollow-import-to=imaplib --nofollow-import-to=imghdr --nofollow-import-to=mailcap --nofollow-import-to=modulefinder --nofollow-import-to=pickletools --nofollow-import-to=pipes --nofollow-import-to=poplib --nofollow-import-to=pstats --nofollow-import-to=pyclbr --nofollow-import-to=sched --nofollow-import-to=sndhdr --nofollow-import-to=sre_compile --nofollow-import-to=sre_constants --nofollow-import-to=sre_parse --nofollow-import-to=stringprep --nofollow-import-to=symtable --nofollow-import-to=timeit --nofollow-import-to=tomllib --nofollow-import-to=trace --nofollow-import-to=uu --nofollow-import-to=xdrlib --nofollow-import-to=_pyio --nofollow-import-to=importlib.simple --nofollow-import-to=importlib.resources.simple --noinclude-pytest-mode=nofollow --noinclude-setuptools-mode=nofollow --python-flag=no_docstrings --msvc=latest --lto=yes --assume-yes-for-downloads --remove-output --output-dir=dist --output-filename="IPTV Player.exe" "$env:ENTRY_FILE"
 
       - name: Bundle vlc_module
         shell: pwsh
@@ -60,7 +62,6 @@ jobs:
           $vlc = Join-Path $dist.FullName "vlc_module"
           Copy-Item -Path "vlc_module" -Destination $vlc -Recurse -Force
 
-          # 删除 IPTV 播放用不到的 VLC 组件（界面、转码/推流、可视化、编码器等，约 44 MB）
           $dropDirs = "gui","access_output","stream_out","mux","visualization","services_discovery","lua","meta_engine"
           foreach ($d in $dropDirs) {
             Remove-Item -Recurse -Force (Join-Path $vlc "plugins/$d") -ErrorAction SilentlyContinue
@@ -70,7 +71,6 @@ jobs:
             Remove-Item -Force (Join-Path $vlc $f) -ErrorAction SilentlyContinue
           }
 
-          # 确认播放必需的组件都还在
           $must = "libvlc.dll","libvlccore.dll","plugins/access/libhttp_plugin.dll","plugins/access/libhttps_plugin.dll","plugins/access/liblive555_plugin.dll","plugins/codec/libavcodec_plugin.dll","plugins/demux/libts_plugin.dll","plugins/video_output/libdirect3d11_plugin.dll","plugins/audio_output/libmmdevice_plugin.dll"
           foreach ($f in $must) {
             if (-not (Test-Path (Join-Path $vlc $f))) { throw "缺少必需的 VLC 组件: $f" }
@@ -82,7 +82,7 @@ jobs:
       - name: Smoke test (启动 10 秒，确认没有闪退)
         shell: pwsh
         run: |
-          $exe = Join-Path $env:DIST_DIR "IPTV Player v$env:APP_VERSION.exe"
+          $exe = Join-Path $env:DIST_DIR "IPTV Player.exe"
           $p = Start-Process -FilePath $exe -WorkingDirectory $env:DIST_DIR -PassThru
           Start-Sleep -Seconds 10
           if ($p.HasExited) {
@@ -91,20 +91,26 @@ jobs:
           Write-Host "程序运行正常，结束进程"
           Stop-Process -Id $p.Id -Force
 
-      - name: Package to ZIP
+      - name: Package to 7z
         shell: pwsh
         run: |
           $releaseDir = "IPTV Player v$env:APP_VERSION"
           Rename-Item -Path $env:DIST_DIR -NewName $releaseDir
-          $zipName = "$releaseDir.zip"
-          Compress-Archive -Path "dist/$releaseDir" -DestinationPath $zipName
-          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+          $archive = "$releaseDir.7z"
+          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) { $sevenZip = "C:\Program Files\7-Zip\7z.exe" }
+          if (-not (Test-Path $sevenZip)) { throw "未找到 7z，可先添加一步 choco install 7zip" }
+          & $sevenZip a -t7z -mx=9 -m0=lzma2 -ms=on -mmt=on $archive "dist/$releaseDir"
+          if ($LASTEXITCODE -ne 0) { throw "7z 压缩失败，退出码 $LASTEXITCODE" }
+          $mb = [math]::Round((Get-Item $archive).Length / 1MB, 1)
+          Write-Host "压缩包大小: $mb MB"
+          echo "ARCHIVE_NAME=$archive" >> $env:GITHUB_ENV
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ env.APP_VERSION }}
           name: v${{ env.APP_VERSION }}
-          files: IPTV*.zip
+          files: IPTV*.7z
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

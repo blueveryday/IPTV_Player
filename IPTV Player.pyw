@@ -20,7 +20,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta, timezone
 
-CODE_VERSION = "IPTV Player v2026.09.20"
+CODE_VERSION = "IPTV Player v2026.09.21"
 
 PY_BITS = struct.calcsize("P") * 8
 SEEK_GRANULARITY = 5
@@ -764,11 +764,21 @@ def epg_update_worker(state, today, n, force_dates):
     finally:
         state["finished"] = True
 
+def apply_app_icon(win):
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        ico = os.path.join(APP_DIR, "src", "asset", "iptv.ico")
+        if os.path.isfile(ico):
+            win.iconbitmap(default=ico)
+    except Exception:
+        pass
 
 class IPTVApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(CODE_VERSION)
+        apply_app_icon(self)
         self.geometry("1280x800")
         self.minsize(960, 590)
         self.configure(bg=COLORS["bg_root"])
