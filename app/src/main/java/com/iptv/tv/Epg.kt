@@ -154,7 +154,7 @@ object Epg {
         return rows
     }
 
-    private fun loadChannels(text: String): List<Pair<String, String>> {
+    fun loadChannels(text: String): List<Pair<String, String>> {
         val rows = parseCsv(text.removePrefix("\uFEFF"))
         if (rows.isEmpty()) throw RuntimeException("频道表为空")
         val hdr = rows[0].map { it.trim().lowercase() }

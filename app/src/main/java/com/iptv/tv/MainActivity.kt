@@ -107,6 +107,7 @@ class MainActivity : AppCompatActivity() {
     private var player: MediaPlayer? = null
     private var pendingStart: Runnable? = null
     private var resumeOnStart = false
+    private var viewsAttached = false
 
     // 回看状态（与原版一致）
     private var rangeStart: LocalDateTime? = null
@@ -125,6 +126,22 @@ class MainActivity : AppCompatActivity() {
 
     private val pickM3u = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) importM3u(uri)
+    }
+
+    private var csvTarget: EditText? = null
+    private val pickCsv = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        val et = csvTarget
+        if (uri == null || et == null) return@registerForActivityResult
+        try {
+            val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
+            val n = Epg.loadChannels(decodeAuto(bytes)).size          // 顺便校验：须含 channelcode、title 两列
+            val dst = File(filesDir, "epg_channels.csv")
+            dst.writeBytes(bytes)
+            et.setText(dst.path)
+            Toast.makeText(this, "已导入频道表（$n 个频道），请点“保存并下载”", Toast.LENGTH_LONG).show()
+        } catch (e: Exception) {
+            alert("导入频道表失败", e.message ?: e.toString())
+        }
     }
 
     // ================= 生命周期 =================
@@ -215,10 +232,18 @@ class MainActivity : AppCompatActivity() {
             cancelPending()
             player?.stop()
         }
+        if (viewsAttached) {
+            try { player?.detachViews() } catch (_: Exception) {}
+            viewsAttached = false
+        }
     }
 
     override fun onStart() {
         super.onStart()
+        if (!viewsAttached) {
+            player?.attachViews(videoLayout, null, false, false)
+            viewsAttached = player != null
+        }
         if (resumeOnStart) {
             resumeOnStart = false
             val ch = current
@@ -236,7 +261,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         epgState?.cancel = true
         cfg.save()
-        try { player?.stop(); player?.detachViews(); player?.release(); libVlc?.release() } catch (_: Exception) {}
+        try { player?.stop(); if (viewsAttached) player?.detachViews(); player?.release(); libVlc?.release() } catch (_: Exception) {}
         super.onDestroy()
     }
 
@@ -597,7 +622,6 @@ class MainActivity : AppCompatActivity() {
         try {
             libVlc = LibVLC(this, arrayListOf("--network-caching=1500", "--quiet"))
             player = MediaPlayer(libVlc).also { p ->
-                p.attachViews(videoLayout, null, false, false)
                 p.setEventListener { ev ->
                     if (ev.type == MediaPlayer.Event.EncounteredError)
                         runOnUiThread { setStatus("播放失败：无法打开该地址（请检查网络、地址或回看参数）：$currentUrl") }
@@ -1126,7 +1150,7 @@ class MainActivity : AppCompatActivity() {
         val rows = listOf(
             "服务器地址" to "epg_host", "路径模板" to "epg_path",
             "日期格式（strftime，如 %Y%m%d）" to "epg_date_fmt",
-            "频道表 CSV（空=内置；可填路径或 http 网址）" to "epg_csv",
+            "频道表 CSV（空=内置；可填路径/网址，或点下方按钮选择文件）" to "epg_csv",
             "下载线程数（1-10）" to "epg_threads", "超时秒数（3-10）" to "epg_timeout")
         val defs = Config.defaults()
         val (box, edits) = formView(rows.map { it.first }, rows.map { (_, k) -> cfg.s(k).ifEmpty { if (k == "epg_threads" || k == "epg_timeout") cfg.i(k).toString() else "" } })
@@ -1142,6 +1166,18 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { rows.forEachIndexed { i, (_, k) -> edits[i].setText(defs[k].toString()) } }
         }
         box.addView(reset)
+        val pick = TextView(this).apply {
+            text = "选择 CSV 文件…"; setPadding(dp(12), dp(10), dp(12), dp(10)); setTextColor(Color.WHITE)
+            isFocusable = true; isClickable = true; setBackgroundResource(R.drawable.item_bg)
+            setOnClickListener {
+                csvTarget = edits[3]
+                try { pickCsv.launch(arrayOf("*/*")) }
+                catch (e: ActivityNotFoundException) {
+                    Toast.makeText(this@MainActivity, "本机没有文件选择器，请在框中直接填路径或网址", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+        box.addView(pick)
 
         fun preview() {
             try {
