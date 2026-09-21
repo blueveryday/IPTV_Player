@@ -3,8 +3,9 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 // 版本号 = 编译日期（北京时间），如 2026-09-21 编译 => 26.09.21
-val buildDate: String = LocalDate.now(ZoneId.of("Asia/Shanghai"))
-    .format(DateTimeFormatter.ofPattern("yy.MM.dd"))
+// GitHub Actions 会用 -PbuildDate=26.09.21 传入；本地编译则取当天日期
+val buildDate: String = (project.findProperty("buildDate") as String?)
+    ?: LocalDate.now(ZoneId.of("Asia/Shanghai")).format(DateTimeFormatter.ofPattern("yy.MM.dd"))
 
 plugins {
     id("com.android.application")

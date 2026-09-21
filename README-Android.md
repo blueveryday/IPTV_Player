@@ -4,9 +4,9 @@
 
 ## 编译 APK
 ### 方式 A：GitHub 在线编译（无需装任何软件）
-1. 把本文件夹全部内容推到你的 GitHub 仓库（含 `.github/workflows/build.yml`）。
-2. 仓库 → Actions → Build APK → Run workflow。
-3. 完成后在 Artifacts 下载 `IPTV-Player-TV-apk`，里面就是 `IPTV Player v26.09.21.apk`（版本号 = 编译日期，北京时间；软件内“菜单”标题和“关于”里也能看到）。
+1. 把本文件夹全部内容推到你的 GitHub 仓库（含 `.github/workflows/build_android.yml`）。
+2. 仓库 → Actions → Build Android APK → Run workflow。
+3. 编译成功后会自动发布到仓库 **Releases** 页面（tag = 版本号，如 `v26.09.21`），直接在那里下载 APK；同一天重复编译会覆盖当天的 Release。也可以在 Actions 该次运行页面下载 `IPTV-Player-v版本号`，里面就是 `IPTV Player v26.09.21.apk`（版本号 = 编译日期，北京时间；软件内“菜单”标题和“关于”里也能看到）。
 
 ### 方式 B：Android Studio
 用 Android Studio（Koala 及以上，JDK 17）打开本文件夹 → 等待 Gradle 同步 → Build > Build APK(s)。
