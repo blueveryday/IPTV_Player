@@ -421,7 +421,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onKeyLongPress(keyCode: Int, ev: KeyEvent): Boolean {
-        if (isCenter(keyCode) && !panelsVisible()) { showMenu(); return true }
+        if (isCenter(keyCode) && !panelsVisible()) { showRight(); return true }
         return super.onKeyLongPress(keyCode, ev)
     }
 
@@ -1101,7 +1101,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun showAbout() {
         alert("关于", "${versionText()}\n\nGitHub：$GITHUB_URL\n\n" +
-                "遥控器：\n确定键=频道列表（长按=菜单）\n上/下=换台　左/右=倒退/快进（5 秒）\n" +
+                "遥控器：\n确定键=频道列表（长按=回看列表）\n上/下=换台　左/右=倒退/快进（5 秒）\n" +
                 "频道列表中 → 进入回看节目单，← 返回\n菜单键=菜单　返回键=关闭面板\n\n" +
                 "触屏：\n左半屏上下滑=亮度　右半屏上下滑=音量\n左边缘右滑=频道菜单　右边缘左滑=回看菜单\n单击=进度条/关闭面板　长按=主菜单")
     }
