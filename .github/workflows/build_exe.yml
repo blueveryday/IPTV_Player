@@ -51,7 +51,6 @@ jobs:
       - name: Bundle vlc_module
         shell: pwsh
         run: |
-          # Nuitka 的 --include-data-dir 不会复制 dll，所以 vlc_module 在编译后整体拷贝到 dist 目录
           if (-not (Test-Path "vlc_module/libvlc.dll")) {
             throw "未找到 vlc_module/libvlc.dll，请检查仓库中的 vlc_module 目录"
           }
@@ -94,14 +93,22 @@ jobs:
       - name: Package to 7z
         shell: pwsh
         run: |
-          $releaseDir = "IPTV Player v$env:APP_VERSION"
+          $releaseDir = "IPTV Player"
+          $archive = "IPTV Player v$env:APP_VERSION.7z"
           Rename-Item -Path $env:DIST_DIR -NewName $releaseDir
-          $archive = "$releaseDir.7z"
+
           $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
           if (-not $sevenZip) { $sevenZip = "C:\Program Files\7-Zip\7z.exe" }
           if (-not (Test-Path $sevenZip)) { throw "未找到 7z，可先添加一步 choco install 7zip" }
-          & $sevenZip a -t7z -mx=9 -m0=lzma2 -ms=on -mmt=on $archive "dist/$releaseDir"
-          if ($LASTEXITCODE -ne 0) { throw "7z 压缩失败，退出码 $LASTEXITCODE" }
+
+          Push-Location dist
+          try {
+            & $sevenZip a -t7z -mx=9 -m0=lzma2 -ms=on -mmt=on "../$archive" $releaseDir
+            if ($LASTEXITCODE -ne 0) { throw "7z 压缩失败，退出码 $LASTEXITCODE" }
+          } finally {
+            Pop-Location
+          }
+
           $mb = [math]::Round((Get-Item $archive).Length / 1MB, 1)
           Write-Host "压缩包大小: $mb MB"
           echo "ARCHIVE_NAME=$archive" >> $env:GITHUB_ENV
