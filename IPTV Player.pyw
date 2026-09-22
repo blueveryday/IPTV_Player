@@ -20,7 +20,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta, timezone
 
-CODE_VERSION = "IPTV Player v2026.09.21"
+CODE_VERSION = "IPTV Player v2026.09.22"
 
 PY_BITS = struct.calcsize("P") * 8
 SEEK_GRANULARITY = 5
