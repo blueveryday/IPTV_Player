@@ -14,16 +14,31 @@ import threading
 import hashlib
 import zipfile
 import urllib.request
-import webbrowser
+import urllib.parse
 import urllib.error
+import base64
+import xml.etree.ElementTree as ET
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta, timezone
 
-CODE_VERSION = "IPTV Player v2026.09.21"
+CODE_VERSION = "IPTV Player v2026.09.23"
 
 PY_BITS = struct.calcsize("P") * 8
 SEEK_GRANULARITY = 5
+
+MEDIA_EXTS = {
+    ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".ts", ".m4v",
+    ".mpg", ".mpeg", ".m2ts", ".mts", ".3gp", ".rmvb", ".rm", ".vob", ".ogv",
+    ".mp3", ".aac", ".flac", ".wav", ".ape", ".ogg", ".wma", ".m4a", ".opus",
+    ".ac3", ".dts", ".aiff", ".aif", ".alac", ".mka", ".mp2", ".mpc", ".wv",
+}
+
+AUDIO_EXTS = {
+    ".mp3", ".aac", ".flac", ".wav", ".ape", ".ogg", ".wma", ".m4a", ".opus",
+    ".ac3", ".dts", ".aiff", ".aif", ".alac", ".mka", ".mp2", ".mpc", ".wv",
+}
 
 WEEKDAY_CN = "一二三四五六日"
 
@@ -284,6 +299,7 @@ DEFAULT_CONFIG = {
     "epg_csv": "",
     "epg_threads": 1,
     "epg_timeout": 10,
+    "webdav_sources": [],
 }
 
 
@@ -396,7 +412,38 @@ def clean_url(line):
     return line.strip("<>")
 
 
+def is_local_media_file(url):
+    if not url or not isinstance(url, str):
+        return False
+    path = url
+    if path.lower().startswith("file://"):
+        try:
+            path = urllib.request.url2pathname(path[7:])
+        except Exception:
+            return False
+    try:
+        if not os.path.isfile(path):
+            return False
+    except Exception:
+        return False
+    return os.path.splitext(path)[1].lower() in MEDIA_EXTS
+
+
+def fmt_ms(ms):
+    try:
+        ms = int(ms)
+    except Exception:
+        ms = 0
+    if ms < 0:
+        ms = 0
+    s = ms // 1000
+    h, r = divmod(s, 3600)
+    m, s = divmod(r, 60)
+    return "%02d:%02d:%02d" % (h, m, s)
+
+
 def parse_m3u(path):
+    base_dir = os.path.dirname(os.path.abspath(path))
     channels = []
     name = None
     for line in read_text_auto(path).splitlines():
@@ -414,12 +461,143 @@ def parse_m3u(path):
         else:
             url = clean_url(line)
             if url:
-                channels.append({"name": name or url, "url": url})
+                resolved = url
+                if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url) \
+                        and not os.path.isabs(url):
+                    cand = os.path.join(base_dir, url)
+                    if os.path.isfile(cand):
+                        resolved = cand
+                entry_name = name
+                if not entry_name:
+                    entry_name = (os.path.basename(resolved)
+                                  if is_local_media_file(resolved) else resolved)
+                ch = {"name": entry_name, "url": resolved}
+                if is_local_media_file(resolved):
+                    ch["local"] = True
+                channels.append(ch)
             name = None
     return channels
 
 
+class WebDAVClient:
+    def __init__(self, url, user="", password="", timeout=15):
+        url = (url or "").strip()
+        if not url.lower().startswith(("http://", "https://")):
+            url = "http://" + url
+        self.base_url = url.rstrip("/")
+        self.user = user or ""
+        self.password = password or ""
+        self.timeout = timeout
+
+    def _headers(self, extra=None):
+        h = {
+            "User-Agent": "IPTVPlayer/1.0 (WebDAV)",
+            "Accept": "*/*",
+        }
+        if self.user or self.password:
+            token = base64.b64encode(
+                ("%s:%s" % (self.user, self.password)).encode("utf-8")
+            ).decode("ascii")
+            h["Authorization"] = "Basic " + token
+        if extra:
+            h.update(extra)
+        return h
+
+    def list(self, rel_path=""):
+        rel = (rel_path or "").strip("/")
+
+        if rel:
+            encoded_rel = "/".join(
+                urllib.parse.quote(seg, safe="") for seg in rel.split("/")
+            )
+        else:
+            encoded_rel = ""
+
+        path = "/" + encoded_rel if encoded_rel else "/"
+        url = self.base_url + path
+
+        body = (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<d:propfind xmlns:d="DAV:">'
+            '<d:prop>'
+            '<d:resourcetype/>'
+            '<d:getcontentlength/>'
+            '</d:prop>'
+            '</d:propfind>'
+        ).encode("utf-8")
+
+        req = urllib.request.Request(
+            url, data=body, method="PROPFIND",
+            headers=self._headers({
+                "Depth": "1",
+                "Content-Type": "application/xml; charset=utf-8",
+            }),
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            data = r.read()
+
+        ns = {"d": "DAV:"}
+        root = ET.fromstring(data)
+
+        base_path = urllib.parse.urlparse(self.base_url).path.rstrip("/")
+        items = []
+
+        for resp in root.findall("d:response", ns):
+            href_el = resp.find("d:href", ns)
+            if href_el is None or not href_el.text:
+                continue
+            href = href_el.text.strip()
+            p = urllib.parse.urlparse(href)
+            href_path = urllib.parse.unquote(p.path)
+
+            if base_path:
+                base_decoded = urllib.parse.unquote(base_path)
+                if href_path.startswith(base_decoded):
+                    sub = href_path[len(base_decoded):]
+                elif href_path.startswith(base_path):
+                    sub = href_path[len(base_path):]
+                else:
+                    sub = href_path
+            else:
+                sub = href_path
+            sub = sub.strip("/")
+
+            cur = rel
+            if sub == cur:
+                continue
+            if cur and not sub.startswith(cur + "/"):
+                continue
+            rest = sub[len(cur):].lstrip("/") if cur else sub
+            if not rest or "/" in rest:
+                continue
+
+            rtype = resp.find("d:propstat/d:prop/d:resourcetype", ns)
+            is_dir = rtype is not None and rtype.find("d:collection", ns) is not None
+
+            size = 0
+            sz_txt = resp.findtext("d:propstat/d:prop/d:getcontentlength", "", ns)
+            try:
+                size = int(sz_txt)
+            except Exception:
+                pass
+
+            encoded_sub = "/".join(
+                urllib.parse.quote(seg, safe="") for seg in sub.split("/")
+            )
+            item_url = self.base_url + "/" + encoded_sub
+
+            items.append({
+                "name": rest,
+                "is_dir": is_dir,
+                "url": item_url,
+                "size": size,
+            })
+        return items
+
+
 def replay_supported(url, cfg=None):
+    if is_local_media_file(url):
+        return False
     u = url.lower()
     if u.startswith("rtsp://"):
         return True
@@ -517,7 +695,6 @@ def _parse_epg_file(path):
 
 
 def load_epg(channel_name, day):
-    """day: datetime.date。返回该日的节目列表（按开始时间排序），没有则返回 []。"""
     d = find_epg_dir(channel_name)
     if not d:
         return []
@@ -561,7 +738,6 @@ def fmt_range(start, end):
 
 
 def _epg_url_fn(cfg):
-    """由配置生成 (channelcode, 'YYYYMMDD') -> 完整下载地址 的函数"""
     host = (cfg.get("epg_host") or "").strip().rstrip("/")
     path = (cfg.get("epg_path") or "").strip()
     if path and not path.startswith(("/", "?")):
@@ -612,7 +788,6 @@ def load_epg_channels(csv_path):
 
 
 def epg_valid_dates(today, n):
-    """[今天-(n-1) … 今天]，格式 YYYYMMDD"""
     return [(today - timedelta(days=i)).strftime("%Y%m%d")
             for i in range(n - 1, -1, -1)]
 
@@ -764,6 +939,7 @@ def epg_update_worker(state, today, n, force_dates):
     finally:
         state["finished"] = True
 
+
 def apply_app_icon(win):
     if not sys.platform.startswith("win"):
         return
@@ -773,6 +949,7 @@ def apply_app_icon(win):
             win.iconbitmap(default=ico)
     except Exception:
         pass
+
 
 class IPTVApp(tk.Tk):
     def __init__(self):
@@ -798,6 +975,10 @@ class IPTVApp(tk.Tk):
         self.vlc_instance = None
         self.fullscreen = False
 
+        self._closing = False
+        self._player_error_cb = None
+        self._closing_after_id = None
+
         self._progress_after_id = None
         self.replay_range_start = None
         self.replay_range_end = None
@@ -810,6 +991,12 @@ class IPTVApp(tk.Tk):
         self.slot_items = []
         self.epg_state = None
         self._live_rewind_mode = False
+
+        self.webdav_mode = False
+        self.webdav_source = None
+        self.webdav_path = ""
+        self.webdav_items = []
+        self._webdav_req_id = 0
 
         self._setup_ttk_style()
         self.build_menu()
@@ -925,6 +1112,8 @@ class IPTVApp(tk.Tk):
             self.cfg["left_width"] = int(self.cfg.get("left_width", 250))
         except Exception:
             self.cfg["left_width"] = 250
+        if not isinstance(self.cfg.get("webdav_sources"), list):
+            self.cfg["webdav_sources"] = []
 
     def save_config(self):
         try:
@@ -945,6 +1134,8 @@ class IPTVApp(tk.Tk):
                     activebackground=COLORS["accent_dim"],
                     activeforeground="#ffffff")
         m.add_command(label="打开 m3u 文件...", command=self.open_m3u)
+        m.add_command(label="打开媒体文件...", command=self.open_media_file)
+        m.add_command(label="浏览 WebDAV...", command=self.open_webdav_dialog)
         m.add_command(label="重新加载", command=self.load_default)
         m.add_separator()
         m.add_command(label="回看参数设置...", command=self.open_settings)
@@ -1042,8 +1233,19 @@ class IPTVApp(tk.Tk):
         self.left_body = ttk.Frame(left, style="Panel.TFrame")
         self.left_body.grid(row=0, column=0, sticky="nsew")
 
+        wf = ttk.Frame(self.left_body, style="Panel.TFrame")
+        wf.pack(fill=tk.X, padx=8, pady=(8, 2))
+        ttk.Label(wf, text="WebDAV", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        self.webdav_var = tk.StringVar()
+        self.webdav_cb = ttk.Combobox(wf, textvariable=self.webdav_var,
+                              state="readonly", width=1)
+        self.webdav_cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.webdav_cb.bind("<<ComboboxSelected>>", self._on_webdav_combo)
+        self._webdav_combo_sources = []
+        self._refresh_webdav_combo()
+
         sf = ttk.Frame(self.left_body, style="Panel.TFrame")
-        sf.pack(fill=tk.X, padx=8, pady=(8, 4))
+        sf.pack(fill=tk.X, padx=8, pady=(4, 4))
         ttk.Label(sf, text="搜索", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 6))
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *a: self.apply_filter())
@@ -1247,6 +1449,24 @@ class IPTVApp(tk.Tk):
         return cls in ("TEntry", "Entry", "TCombobox", "Text",
                        "TScale", "TSpinbox", "Spinbox")
 
+    def _is_local_media(self, ch):
+        if not ch:
+            return False
+        if ch.get("local"):
+            return True
+        return is_local_media_file(ch.get("url", ""))
+
+    def _is_file_playback(self, ch=None):
+        if ch is None:
+            ch = self.current
+        if not ch:
+            return False
+        if self._is_local_media(ch):
+            return True
+        if ch.get("webdav") and not ch.get("is_dir"):
+            return True
+        return False
+
     def _current_replay_pos(self):
         if (self.replay_range_start is None or self.replay_range_end is None
                 or self.replay_anchor_time is None or self.replay_anchor_wall is None):
@@ -1348,7 +1568,6 @@ class IPTVApp(tk.Tk):
         self.replay_anchor_time = new_time
         self.replay_anchor_wall = now
         self.replay_range_end = now
-        # 立即刷新进度条，避免等到下一帧
         total_sec = (self.replay_range_end - self.replay_range_start).total_seconds()
         if total_sec > 0:
             offset = (new_time - self.replay_range_start).total_seconds()
@@ -1377,6 +1596,9 @@ class IPTVApp(tk.Tk):
             return None
         if self.seek_bar.is_dragging():
             return None
+        if self._is_file_playback():
+            self._seek_local_media_relative(-SEEK_GRANULARITY * 1000)
+            return "break"
         if self.current_live:
             self._live_rewind_start()
             return "break"
@@ -1390,6 +1612,9 @@ class IPTVApp(tk.Tk):
             return None
         if self.seek_bar.is_dragging():
             return None
+        if self._is_file_playback():
+            self._seek_local_media_relative(SEEK_GRANULARITY * 1000)
+            return "break"
         if self.current_live:
             return "break"
         if self.replay_range_start is None or self.replay_range_end is None:
@@ -1447,7 +1672,8 @@ class IPTVApp(tk.Tk):
         self.ch_list.activate(idx)
         self.ch_list.see(idx)
         self.on_channel_select()
-        self.play_live()
+        if not self.webdav_mode:
+            self.play_live()
         return "break"
 
     def _on_slot_click(self, event=None):
@@ -1470,9 +1696,13 @@ class IPTVApp(tk.Tk):
         ch = self.selected_channel()
         if ch is None:
             return None
+        if ch.get("webdav"):
+            return False
         return replay_supported(ch["url"], self.cfg)
 
     def _on_video_right_click(self, event):
+        if self.webdav_mode:
+            return
         ch = self.selected_channel() or self.current
         m = tk.Menu(self, tearoff=0,
                     bg=COLORS["bg_panel"], fg=COLORS["fg_primary"],
@@ -1488,11 +1718,18 @@ class IPTVApp(tk.Tk):
                 m.grab_release()
             return
 
-        m.add_command(label="▶ 直播  %s" % ch["name"],
-                      command=self.play_live)
+        is_local = self._is_local_media(ch)
+        if is_local:
+            m.add_command(label="▶ 播放  %s" % ch["name"],
+                          command=self.play_live)
+        else:
+            m.add_command(label="▶ 直播  %s" % ch["name"],
+                          command=self.play_live)
         m.add_separator()
 
-        if not replay_supported(ch["url"], self.cfg):
+        if is_local:
+            m.add_command(label="本地媒体文件，无回看", state="disabled")
+        elif not replay_supported(ch["url"], self.cfg):
             m.add_command(label="该频道不支持回看", state="disabled")
         else:
             replay_menu = tk.Menu(m, tearoff=0,
@@ -1565,11 +1802,68 @@ class IPTVApp(tk.Tk):
         except Exception:
             pass
 
+    def _update_local_media_progress(self):
+        if self.player is None:
+            return
+        try:
+            t = self.player.get_time()
+            l = self.player.get_length()
+        except Exception:
+            return
+        if l and l > 0:
+            self.seek_bar.set_enabled(True)
+            pos = max(0, min(1000, int(t * 1000 / l)))
+            self.seek_bar.set_value(pos)
+            self.time_var.set("%s / %s" % (fmt_ms(t), fmt_ms(l)))
+        else:
+            self.seek_bar.set_enabled(False)
+            self.seek_bar.set_value(0)
+            self.time_var.set("--:--:-- / --:--:--")
+
+    def _seek_local_media(self, value, phase):
+        if self.player is None:
+            return
+        try:
+            length = self.player.get_length()
+        except Exception:
+            return
+        if not length or length <= 0:
+            return
+        target_ms = int(length * float(value) / 1000.0)
+        target_ms = max(0, min(length, target_ms))
+        if phase == "preview":
+            self.time_var.set("%s / %s" % (fmt_ms(target_ms), fmt_ms(length)))
+            return
+        try:
+            self.player.set_time(target_ms)
+        except Exception:
+            pass
+        self.time_var.set("%s / %s" % (fmt_ms(target_ms), fmt_ms(length)))
+
+    def _seek_local_media_relative(self, delta_ms):
+        if self.player is None:
+            return
+        try:
+            t = self.player.get_time()
+            l = self.player.get_length()
+        except Exception:
+            return
+        if not l or l <= 0:
+            return
+        nt = max(0, min(l, t + delta_ms))
+        try:
+            self.player.set_time(nt)
+        except Exception:
+            pass
+        self.time_var.set("%s / %s" % (fmt_ms(nt), fmt_ms(l)))
+
     def _update_progress(self):
         self._progress_after_id = None
         try:
             if self.seek_bar.is_dragging():
                 pass
+            elif self._is_file_playback():
+                self._update_local_media_progress()
             elif self.current_live and self.replay_range_start is None:
                 if self.current is not None:
                     self._refresh_live_bar()
@@ -1613,6 +1907,9 @@ class IPTVApp(tk.Tk):
             pass
 
     def _on_seek_bar(self, value, phase):
+        if self._is_file_playback():
+            self._seek_local_media(value, phase)
+            return
         ch = self.current
         if self.replay_range_start is None or self.replay_range_end is None:
             if not ch:
@@ -1712,7 +2009,6 @@ class IPTVApp(tk.Tk):
             return None
 
     def build_day_slots(self, ch, day_date):
-        """返回 ([(label, start, end), ...], from_epg)。有 EPG 用节目，否则用整点。"""
         progs = load_epg(ch["name"], day_date) if ch else []
         if progs:
             return [("%s  %s" % (fmt_range(p["start"], p["end"]), p["title"]),
@@ -1892,7 +2188,6 @@ class IPTVApp(tk.Tk):
             st["ok"], st["nodata"], st["fail"], st["removed"])
 
         if st["silent"]:
-            # 静默模式：不弹窗；正在播放时不覆盖状态栏
             if not st["error"] and changed and not self.current_url:
                 self.status_var.set(summary)
         elif st["error"]:
@@ -1933,9 +2228,29 @@ class IPTVApp(tk.Tk):
     def refresh_slots(self):
         self.slot_list.delete(0, tk.END)
         self.slot_items = []
+
+        if self.webdav_mode:
+            self._slots_locked = True
+            self.epg_var.set("WebDAV 浏览模式")
+            try:
+                self.slot_list.configure(cursor="")
+            except Exception:
+                pass
+            return
+
         day = self.selected_date()
         now = self.local_now()
         ch = self.selected_channel()
+
+        if ch is not None and self._is_local_media(ch):
+            self._slots_locked = True
+            self.epg_var.set("本地媒体文件，无回看")
+            try:
+                self.slot_list.configure(cursor="")
+            except Exception:
+                pass
+            return
+
         self._slots_locked = (self._replay_allowed() is False)
         if day is None:
             return
@@ -1995,22 +2310,410 @@ class IPTVApp(tk.Tk):
         if p:
             self.load_m3u(p)
 
+    def _is_media_name(self, name):
+        return os.path.splitext(name)[1].lower() in MEDIA_EXTS
+
+    def _is_audio_name(self, name):
+        return os.path.splitext(name)[1].lower() in AUDIO_EXTS
+
+    def open_webdav_dialog(self):
+        win = tk.Toplevel(self)
+        win.title("浏览 WebDAV")
+        win.configure(bg=COLORS["bg_panel"])
+        win.transient(self)
+        win.resizable(False, False)
+
+        sources = list(self.cfg.get("webdav_sources") or [])
+        names = [s.get("name") or s.get("url") or "?" for s in sources]
+
+        frm = ttk.Frame(win, style="Panel.TFrame")
+        frm.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+
+        ttk.Label(frm, text="已保存的连接", style="Dim.TLabel").grid(
+            row=0, column=0, sticky="e", padx=(0, 8), pady=4)
+        saved_var = tk.StringVar()
+        saved_cb = ttk.Combobox(frm, textvariable=saved_var, values=names,
+                                state="readonly", width=42)
+        saved_cb.grid(row=0, column=1, columnspan=2, sticky="we", pady=4)
+
+        ttk.Label(frm, text="名称", style="Panel.TLabel").grid(
+            row=1, column=0, sticky="e", padx=(0, 8), pady=4)
+        name_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=name_var, width=42).grid(
+            row=1, column=1, columnspan=2, sticky="we", pady=4)
+
+        ttk.Label(frm, text="地址", style="Panel.TLabel").grid(
+            row=2, column=0, sticky="e", padx=(0, 8), pady=4)
+        url_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=url_var, width=42).grid(
+            row=2, column=1, columnspan=2, sticky="we", pady=4)
+
+        ttk.Label(frm, text="用户名", style="Panel.TLabel").grid(
+            row=3, column=0, sticky="e", padx=(0, 8), pady=4)
+        user_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=user_var, width=42).grid(
+            row=3, column=1, columnspan=2, sticky="we", pady=4)
+
+        ttk.Label(frm, text="密码", style="Panel.TLabel").grid(
+            row=4, column=0, sticky="e", padx=(0, 8), pady=4)
+        pass_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=pass_var, width=42, show="●").grid(
+            row=4, column=1, columnspan=2, sticky="we", pady=4)
+
+        save_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frm, text="保存到配置", variable=save_var).grid(
+            row=5, column=1, sticky="w", pady=4)
+
+        ttk.Label(frm, text="示例：http://192.168.1.10:5005/dav  或  https://nas.local/webdav",
+                  style="Dim.TLabel").grid(row=6, column=0, columnspan=3,
+                                           sticky="w", pady=(0, 8))
+
+        def load_saved(_e=None):
+            i = saved_cb.current()
+            if i < 0 or i >= len(sources):
+                return
+            s = sources[i]
+            name_var.set(s.get("name", ""))
+            url_var.set(s.get("url", ""))
+            user_var.set(s.get("user", ""))
+            pass_var.set(s.get("password", ""))
+        saved_cb.bind("<<ComboboxSelected>>", load_saved)
+        if names:
+            saved_cb.current(0)
+            load_saved()
+
+        def do_connect():
+            name = name_var.get().strip()
+            url = url_var.get().strip()
+            user = user_var.get().strip()
+            pwd = pass_var.get()
+            if not url:
+                messagebox.showerror("错误", "请填写 WebDAV 地址", parent=win)
+                return
+            if not url.lower().startswith(("http://", "https://")):
+                url = "http://" + url
+                url_var.set(url)
+            if not name:
+                name = url
+                name_var.set(name)
+
+            if save_var.get():
+                entry = {"name": name, "url": url, "user": user, "password": pwd}
+                src_list = list(self.cfg.get("webdav_sources") or [])
+                for i, s in enumerate(src_list):
+                    if (s.get("name") or "") == name:
+                        src_list[i] = entry
+                        break
+                else:
+                    src_list.append(entry)
+                self.cfg["webdav_sources"] = src_list
+                self.save_config()
+
+            self._refresh_webdav_combo()
+            win.destroy()
+            self._enter_webdav({"name": name, "url": url,
+                                "user": user, "password": pwd})
+
+        def do_delete():
+            i = saved_cb.current()
+            if i < 0 or i >= len(sources):
+                return
+            s = sources[i]
+            if not messagebox.askyesno(
+                    "确认", "删除已保存的连接“%s”？" % (s.get("name") or s.get("url")),
+                    parent=win):
+                return
+            src_list = list(self.cfg.get("webdav_sources") or [])
+            src_list.pop(i)
+            self.cfg["webdav_sources"] = src_list
+            self.save_config()
+            self._refresh_webdav_combo()
+            win.destroy()
+            self.open_webdav_dialog()
+
+        bf = ttk.Frame(frm, style="Panel.TFrame")
+        bf.grid(row=7, column=0, columnspan=3, pady=(10, 0))
+        ttk.Button(bf, text="连接", command=do_connect).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="删除", command=do_delete).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=6)
+
+        win.grab_set()
+        center_window(win, self)
+
+    def _refresh_webdav_combo(self):
+        if not hasattr(self, "webdav_cb"):
+            return
+        sources = list(self.cfg.get("webdav_sources") or [])
+        self._webdav_combo_sources = sources
+
+        names = ["📄 IPTV（本地列表）"]
+        for s in sources:
+            names.append("🌐 " + (s.get("name") or s.get("url") or "?"))
+
+        self.webdav_cb["values"] = names
+
+        if self.webdav_mode and self.webdav_source:
+            cur = self.webdav_source.get("name") or self.webdav_source.get("url") or ""
+            try:
+                idx = names.index("🌐 " + cur)
+            except ValueError:
+                idx = 0
+            self.webdav_var.set(names[idx])
+        else:
+            self.webdav_var.set(names[0])
+
+    def _on_webdav_combo(self, event=None):
+        idx = self.webdav_cb.current()
+        if idx < 0:
+            return
+
+        if idx == 0:
+            if not os.path.isfile(DEFAULT_M3U):
+                self.status_var.set("未找到 %s，请通过“文件 → 打开 m3u 文件”加载" % DEFAULT_M3U)
+                self._refresh_webdav_combo()
+                return
+            self.load_m3u(DEFAULT_M3U)
+            self.status_var.set("已切换到本地IPTV列表：%s" % DEFAULT_M3U)
+            return
+
+        src_idx = idx - 1
+        if src_idx >= len(self._webdav_combo_sources):
+            return
+        src = self._webdav_combo_sources[src_idx]
+
+        if (self.webdav_mode and self.webdav_source
+                and self.webdav_source.get("url") == src.get("url")
+                and self.webdav_source.get("user") == src.get("user")):
+            return
+
+        self._enter_webdav(dict(src))
+
+    def _enter_webdav(self, source):
+        self.webdav_mode = True
+        self.webdav_source = source
+        self.webdav_path = ""
+        self.webdav_items = []
+        if self.search_var.get():
+            self.search_var.set("")
+        self._refresh_webdav_combo()
+        self.status_var.set("正在连接 WebDAV：%s" % source["url"])
+        self._navigate_webdav("")
+
+    def _exit_webdav(self):
+        if not self.webdav_mode:
+            return
+        self.webdav_mode = False
+        self.webdav_source = None
+        self.webdav_path = ""
+        self.webdav_items = []
+        self.apply_filter()
+        self._refresh_webdav_combo()
+        self.status_var.set("已退出 WebDAV 浏览")
+
+    def _navigate_webdav(self, path):
+        src = self.webdav_source
+        if not src:
+            return
+        self._webdav_req_id += 1
+        req_id = self._webdav_req_id
+
+        self.status_var.set("正在加载 WebDAV 目录：%s" % (path or "/"))
+
+        def worker():
+            try:
+                client = WebDAVClient(src["url"], src.get("user", ""),
+                                      src.get("password", ""), timeout=15)
+                entries = client.list(path)
+            except Exception as e:
+                err_msg = str(e)
+                self.after(0, lambda: self._on_webdav_error(req_id, path, err_msg))
+                return
+            self.after(0, lambda: self._on_webdav_loaded(req_id, path, entries))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_webdav_loaded(self, req_id, path, entries):
+        if req_id != self._webdav_req_id:
+            return
+
+        self.webdav_path = path
+        items = []
+
+        if path:
+            parent = path.rsplit("/", 1)[0] if "/" in path else ""
+            items.append({
+                "name": "⬅ 返回上级", "webdav": True, "is_dir": True,
+                "is_back": True, "path": parent, "url": "",
+            })
+        else:
+            items.append({
+                "name": "⬅ 退出 WebDAV 浏览", "webdav": True, "is_dir": True,
+                "is_back": True, "exit_browse": True, "path": "", "url": "",
+            })
+
+        dirs, files = [], []
+        for e in entries:
+            nm = e.get("name", "")
+            if not nm or nm.startswith("."):
+                continue
+            if e.get("is_dir"):
+                dirs.append(e)
+            elif self._is_media_name(nm):
+                files.append(e)
+
+        dirs.sort(key=lambda x: x["name"].lower())
+        files.sort(key=lambda x: x["name"].lower())
+
+        for d in dirs:
+            items.append({
+                "name": "📁 " + d["name"], "webdav": True, "is_dir": True,
+                "path": (path + "/" + d["name"]).strip("/") if path else d["name"],
+                "url": d["url"], "raw_name": d["name"],
+            })
+        for f in files:
+            mark = "🎵 " if self._is_audio_name(f["name"]) else "🎬 "
+            items.append({
+                "name": mark + f["name"], "webdav": True, "is_dir": False,
+                "path": (path + "/" + f["name"]).strip("/") if path else f["name"],
+                "url": f["url"], "raw_name": f["name"],
+            })
+
+        self.webdav_items = items
+        self.apply_filter()
+        self.status_var.set("WebDAV %s：%d 个子目录，%d 个媒体文件" %
+                            (path or "/", len(dirs), len(files)))
+
+    def _on_webdav_error(self, req_id, path, err):
+        if req_id != self._webdav_req_id:
+            return
+        self.status_var.set("WebDAV 加载失败：%s" % err)
+        messagebox.showerror("WebDAV 错误",
+                             "无法读取目录：%s\n\n%s" % (path or "/", err))
+
+    def _play_webdav_file(self, item):
+        src = self.webdav_source or {}
+        user = (src.get("user") or "").strip()
+        pwd = src.get("password") or ""
+        url = item.get("url") or ""
+        if not url:
+            self.status_var.set("WebDAV 条目缺少 URL")
+            return
+
+        if user:
+            p = urllib.parse.urlparse(url)
+            netloc = "%s:%s@%s" % (
+                urllib.parse.quote(user, safe=""),
+                urllib.parse.quote(pwd, safe=""),
+                p.netloc,
+            )
+            url = urllib.parse.urlunparse(
+                (p.scheme, netloc, p.path, p.params, p.query, p.fragment))
+
+        self.current = item
+        self.current_url = url
+        self.current_title = "[WebDAV] " + item.get("raw_name", item["name"])
+        self.current_live = False
+        self._clear_replay_range()
+
+        if self.player is None:
+            self.play_external(url)
+            self.status_var.set("正在使用外部播放器：%s" % item["name"])
+            return
+
+        try:
+            media = self.vlc_instance.media_new(url)
+            media.add_option(":http-reconnect=true")
+            media.add_option(":avcodec-hw=%s" %
+                             ("any" if self.cfg.get("hw_decode", True) else "none"))
+            self.player.set_media(media)
+            self.player.play()
+            self.player.audio_set_volume(self.vol_var.get())
+            self.status_var.set("正在播放：%s" % item["name"])
+        except Exception as e:
+            self.status_var.set("播放失败：%s" % e)
+
+    def open_media_file(self):
+        all_exts = " ".join("*" + e for e in sorted(MEDIA_EXTS))
+        types = [
+            ("媒体文件（视频/音频）", all_exts),
+            ("视频文件", "*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.webm *.ts *.m4v *.mpg *.mpeg"),
+            ("音频文件", "*.mp3 *.aac *.flac *.wav *.ape *.ogg *.wma *.m4a *.opus"),
+            ("所有文件", "*.*"),
+        ]
+        paths = filedialog.askopenfilenames(title="选择媒体文件", filetypes=types)
+        if not paths:
+            return
+
+        added = []
+        for p in paths:
+            if not os.path.isfile(p):
+                continue
+            if any(c["url"] == p for c in self.channels):
+                continue
+            name = os.path.splitext(os.path.basename(p))[0]
+            ch = {"name": name, "url": p, "local": True}
+            self.channels.append(ch)
+            added.append(ch)
+
+        if not added:
+            self.status_var.set("未添加新的媒体文件")
+            return
+
+        if self.search_var.get():
+            self.search_var.set("")
+        else:
+            self.apply_filter()
+
+        first = added[0]
+        try:
+            idx = self.filtered.index(first)
+        except ValueError:
+            idx = None
+
+        if idx is not None:
+            self.ch_list.selection_clear(0, tk.END)
+            self.ch_list.selection_set(idx)
+            self.ch_list.activate(idx)
+            self.ch_list.see(idx)
+
+        self.current = first
+        self._clear_replay_range()
+        self.seek_bar.set_enabled(False)
+        self.seek_bar.set_value(0)
+        self.time_var.set("--:--:-- / --:--:--")
+        self._play_local_file(first["url"], "[媒体] " + first["name"])
+        self.status_var.set("已添加 %d 个媒体文件，正在播放：%s"
+                            % (len(added), first["name"]))
+
     def load_m3u(self, path):
+        self.webdav_mode = False
+        self.webdav_source = None
+        self.webdav_path = ""
+        self.webdav_items = []
         try:
             self.channels = parse_m3u(path)
         except Exception as e:
             messagebox.showerror("错误", "读取 m3u 失败：%s" % e)
             return
         self.apply_filter()
+        self._refresh_webdav_combo()
         self.status_var.set("已加载 %d 个频道：%s" % (len(self.channels), path))
 
     def apply_filter(self):
         kw = self.search_var.get().strip().lower()
-        self.filtered = [c for c in self.channels if kw in c["name"].lower()]
+        source = self.webdav_items if self.webdav_mode else self.channels
+        if kw:
+            self.filtered = [c for c in source
+                             if c.get("is_back") or kw in c["name"].lower()]
+        else:
+            self.filtered = list(source)
         self.ch_list.delete(0, tk.END)
         for c in self.filtered:
             self.ch_list.insert(tk.END, c["name"])
-        self.count_var.set("%d / %d 个频道" % (len(self.filtered), len(self.channels)))
+        if self.webdav_mode:
+            self.count_var.set("%d / %d 项" % (len(self.filtered), len(source)))
+        else:
+            self.count_var.set("%d / %d 个频道" % (len(self.filtered), len(source)))
         self.refresh_slots()
 
     def selected_channel(self):
@@ -2021,8 +2724,25 @@ class IPTVApp(tk.Tk):
 
     def on_channel_select(self):
         ch = self.selected_channel()
+
+        if self.webdav_mode:
+            if ch:
+                if ch.get("is_back"):
+                    self.replay_ch_var.set("返回")
+                elif ch.get("is_dir"):
+                    self.replay_ch_var.set("目录：%s" % ch.get("raw_name", ""))
+                else:
+                    self.replay_ch_var.set("文件：%s" % ch.get("raw_name", ""))
+            self.refresh_slots()
+            return
+
         if ch:
-            tip = "" if replay_supported(ch["url"], self.cfg) else "（不支持回看）"
+            if self._is_local_media(ch):
+                tip = "（本地媒体文件）"
+            elif replay_supported(ch["url"], self.cfg):
+                tip = ""
+            else:
+                tip = "（不支持回看）"
             self.replay_ch_var.set("%s %s" % (ch["name"], tip))
         self.refresh_slots()
 
@@ -2040,7 +2760,11 @@ class IPTVApp(tk.Tk):
                 self.status_var.set("未检测到 python-vlc/VLC，将使用外部播放器（vlc/mpv/ffplay）")
             return
         try:
-            self.vlc_instance = vlc.Instance("--network-caching=1500", "--quiet")
+            self.vlc_instance = vlc.Instance(
+                "--network-caching=1500",
+                "--no-video-title-show",
+                "--quiet",
+            )
             self.player = self.vlc_instance.media_player_new()
             self.update_idletasks()
             wid = self.video.winfo_id()
@@ -2053,13 +2777,24 @@ class IPTVApp(tk.Tk):
             self.player.video_set_mouse_input(False)
             self.player.video_set_key_input(False)
             self.player.audio_set_volume(self.vol_var.get())
+
+            self._player_error_cb = lambda e: self.after(0, self._on_player_error)
             em = self.player.event_manager()
             em.event_attach(vlc.EventType.MediaPlayerEncounteredError,
-                            lambda e: self.after(0, lambda: self.status_var.set(
-                                "播放失败：无法打开该地址（请检查网络、地址或回看参数）：" + self.current_url)))
+                            self._player_error_cb)
         except Exception as e:
             self.player = None
             self.status_var.set("VLC 初始化失败，改用外部播放器：%s" % e)
+
+    def _on_player_error(self):
+        if getattr(self, "_closing", False):
+            return
+        try:
+            self.status_var.set(
+                "播放失败：无法打开该地址（请检查网络、地址或回看参数）："
+                + self.current_url)
+        except Exception:
+            pass
 
     def start_auto_install(self):
         if getattr(self, "installing", False):
@@ -2181,7 +2916,75 @@ class IPTVApp(tk.Tk):
                 "下载失败",
                 "%s\n\n可稍后重试（文件 → 下载免安装 VLC 组件），或在“回看参数设置”里指定 PotPlayer 等外部播放器。" % msg)
 
+    def _play_local_file(self, path, title):
+        self.current_url = path
+        self.current_title = title
+        self.current_live = False
+
+        if self.player is None:
+            self.play_external(path)
+            self.status_var.set("正在使用外部播放器：%s" % title)
+            return
+
+        if not os.path.isfile(path):
+            self.status_var.set("文件不存在：%s" % path)
+            messagebox.showwarning("文件不存在", path, parent=self)
+            return
+
+        media = None
+        try:
+            media = self.vlc_instance.media_new_path(path)
+        except Exception as e:
+            print("[play] media_new_path failed:", e)
+
+        if media is None or not media.get_mrl():
+            try:
+                mrl = self._path_to_mrl(path)
+                media = self.vlc_instance.media_new(mrl)
+                print("[play] fallback media_new:", mrl)
+            except Exception as e:
+                print("[play] media_new fallback failed:", e)
+
+        if media is None:
+            self.status_var.set("VLC 无法识别该文件：%s" % path)
+            messagebox.showwarning(
+                "无法播放",
+                "VLC 无法创建媒体对象。\n可能原因：\n"
+                "• 文件被占用或损坏\n"
+                "• 路径含特殊字符\n"
+                "• VLC 未正确安装\n\n文件：%s" % path, parent=self)
+            return
+
+        try:
+            media.add_option(":avcodec-hw=%s" %
+                             ("any" if self.cfg.get("hw_decode", True) else "none"))
+        except Exception:
+            pass
+
+        try:
+            self.player.set_media(media)
+            ret = self.player.play()
+            if ret == -1:
+                self.status_var.set("VLC 拒绝播放：%s" % title)
+                print("[play] player.play() returned -1 for", path)
+                return
+            self.player.audio_set_volume(self.vol_var.get())
+            self.status_var.set("正在播放：%s" % title)
+        except Exception as e:
+            self.status_var.set("播放异常：%s" % e)
+            messagebox.showwarning("播放失败", str(e), parent=self)
+
+    def _path_to_mrl(self, path):
+        p = os.path.abspath(path).replace("\\", "/")
+        if not p.startswith("/"):
+            p = "/" + p
+        return "file://" + urllib.parse.quote(p, safe="/:")
+
     def play_url(self, url, title, live=True):
+        if is_local_media_file(url):
+            self._play_local_file(url, title)
+            return
+
         self.current_url = url
         self.current_title = title
         self.current_live = live
@@ -2250,15 +3053,38 @@ class IPTVApp(tk.Tk):
         if not ch:
             messagebox.showinfo("提示", "请先选择频道")
             return
+
+        if ch.get("webdav"):
+            if ch.get("exit_browse"):
+                self._exit_webdav()
+                return
+            if ch.get("is_dir"):
+                self._navigate_webdav(ch.get("path", ""))
+                return
+            self._play_webdav_file(ch)
+            return
+
         self._clear_replay_range()
         self.current = ch
-        self.play_url(ch["url"], "[直播] " + ch["name"])
-        self._refresh_live_bar()
+        if self._is_local_media(ch):
+            self.seek_bar.set_enabled(False)
+            self.seek_bar.set_value(0)
+            self.time_var.set("--:--:-- / --:--:--")
+            self._play_local_file(ch["url"], "[媒体] " + ch["name"])
+        else:
+            self.play_url(ch["url"], "[直播] " + ch["name"])
+            self._refresh_live_bar()
 
     def replay_url_for_selection(self):
         ch = self.selected_channel() or self.current
         if not ch:
             messagebox.showinfo("提示", "请先在左侧选择频道")
+            return None
+        if ch.get("webdav"):
+            messagebox.showinfo("提示", "WebDAV 文件不支持回看")
+            return None
+        if self._is_local_media(ch):
+            messagebox.showinfo("提示", "本地媒体文件不支持回看")
             return None
         if not replay_supported(ch["url"], self.cfg):
             messagebox.showinfo("提示", "该频道不支持回看")
@@ -2537,6 +3363,10 @@ class IPTVApp(tk.Tk):
         center_window(win, self)
 
     def on_close(self):
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+
         if self.epg_state:
             self.epg_state["cancel"] = True
 
@@ -2546,15 +3376,70 @@ class IPTVApp(tk.Tk):
             except Exception:
                 pass
             self._progress_after_id = None
+
+        if self._closing_after_id:
+            try:
+                self.after_cancel(self._closing_after_id)
+            except Exception:
+                pass
+            self._closing_after_id = None
+
         self.save_config()
+
         try:
-            if self.player is not None:
-                self.player.stop()
-                self.player.release()
+            self.withdraw()
         except Exception:
             pass
-        self.kill_external()
-        self.destroy()
+
+        try:
+            if self.player is not None:
+                try:
+                    em = self.player.event_manager()
+                    if self._player_error_cb is not None:
+                        em.event_detach(vlc.EventType.MediaPlayerEncounteredError)
+                except Exception:
+                    pass
+                try:
+                    self.player.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        self._closing_after_id = self.after(450, self._final_close)
+
+    def _final_close(self):
+        self._closing_after_id = None
+
+        try:
+            if self.player is not None:
+                try:
+                    self.player.release()
+                except Exception:
+                    pass
+                self.player = None
+        except Exception:
+            pass
+
+        try:
+            if self.vlc_instance is not None:
+                try:
+                    self.vlc_instance.release()
+                except Exception:
+                    pass
+                self.vlc_instance = None
+        except Exception:
+            pass
+
+        try:
+            self.kill_external()
+        except Exception:
+            pass
+
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

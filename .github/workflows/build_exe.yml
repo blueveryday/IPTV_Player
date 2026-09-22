@@ -2,6 +2,10 @@ name: Build IPTV Player EXE (Nuitka + MSVC)
 on:
   workflow_dispatch:
 
+concurrency:
+  group: build-exe-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write
 
@@ -40,13 +44,16 @@ jobs:
           }
           Write-Host "入口文件: $($file.Name)"
           Write-Host "版本号: $version"
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          Write-Host "提交: $shortSha"
           echo "APP_VERSION=$version" >> $env:GITHUB_ENV
           echo "ENTRY_FILE=$($file.Name)" >> $env:GITHUB_ENV
+          echo "SHORT_SHA=$shortSha" >> $env:GITHUB_ENV
 
       - name: Build EXE with Nuitka (MSVC)
         shell: pwsh
         run: |
-          python -m nuitka --standalone --windows-console-mode=disable --windows-icon-from-ico=src/asset/iptv.ico --enable-plugin=tk-inter --include-module=vlc --include-data-dir=src=src --nofollow-import-to=unittest --nofollow-import-to=test --nofollow-import-to=pydoc --nofollow-import-to=cgi --nofollow-import-to=cgitb --nofollow-import-to=chunk --nofollow-import-to=colorsys --nofollow-import-to=configparser --nofollow-import-to=crypt --nofollow-import-to=filecmp --nofollow-import-to=fileinput --nofollow-import-to=graphlib --nofollow-import-to=html.parser --nofollow-import-to=_markupbase --nofollow-import-to=imaplib --nofollow-import-to=imghdr --nofollow-import-to=mailcap --nofollow-import-to=modulefinder --nofollow-import-to=pickletools --nofollow-import-to=pipes --nofollow-import-to=poplib --nofollow-import-to=pstats --nofollow-import-to=pyclbr --nofollow-import-to=sched --nofollow-import-to=sndhdr --nofollow-import-to=sre_compile --nofollow-import-to=sre_constants --nofollow-import-to=sre_parse --nofollow-import-to=stringprep --nofollow-import-to=symtable --nofollow-import-to=timeit --nofollow-import-to=tomllib --nofollow-import-to=trace --nofollow-import-to=uu --nofollow-import-to=xdrlib --nofollow-import-to=_pyio --nofollow-import-to=importlib.simple --nofollow-import-to=importlib.resources.simple --noinclude-pytest-mode=nofollow --noinclude-setuptools-mode=nofollow --python-flag=no_docstrings --msvc=latest --lto=yes --assume-yes-for-downloads --remove-output --output-dir=dist --output-filename="IPTV Player.exe" "$env:ENTRY_FILE"
+          python -m nuitka --standalone --windows-console-mode=disable --windows-icon-from-ico=src/asset/iptv.ico --enable-plugin=tk-inter --include-module=vlc --include-data-dir=src=src --nofollow-import-to=unittest --nofollow-import-to=test --nofollow-import-to=pydoc --nofollow-import-to=cgi --nofollow-import-to=cgitb --nofollow-import-to=chunk --nofollow-import-to=colorsys --nofollow-import-to=configparser --nofollow-import-to=crypt --nofollow-import-to=filecmp --nofollow-import-to=fileinput --nofollow-import-to=graphlib --nofollow-import-to=html.parser --nofollow-import-to=_markupbase --nofollow-import-to=imaplib --nofollow-import-to=imghdr --nofollow-import-to=mailcap --nofollow-import-to=modulefinder --nofollow-import-to=pickletools --nofollow-import-to=pipes --nofollow-import-to=poplib --nofollow-import-to=pstats --nofollow-import-to=pyclbr --nofollow-import-to=sched --nofollow-import-to=sndhdr --nofollow-import-to=sre_compile --nofollow-import-to=sre_constants --nofollow-import-to=sre_parse --nofollow-import-to=symtable --nofollow-import-to=timeit --nofollow-import-to=tomllib --nofollow-import-to=trace --nofollow-import-to=uu --nofollow-import-to=xdrlib --nofollow-import-to=_pyio --nofollow-import-to=importlib.simple --nofollow-import-to=importlib.resources.simple --noinclude-pytest-mode=nofollow --noinclude-setuptools-mode=nofollow --python-flag=no_docstrings --msvc=latest --lto=yes --assume-yes-for-downloads --remove-output --output-dir=dist --output-filename="IPTV Player.exe" "$env:ENTRY_FILE"
 
       - name: Bundle vlc_module
         shell: pwsh
@@ -94,7 +101,7 @@ jobs:
         shell: pwsh
         run: |
           $releaseDir = "IPTV Player"
-          $archive = "IPTV Player v$env:APP_VERSION.7z"
+          $archive = "IPTV Player v$env:APP_VERSION-$env:SHORT_SHA.7z"
           Rename-Item -Path $env:DIST_DIR -NewName $releaseDir
 
           $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
@@ -116,8 +123,10 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ env.APP_VERSION }}
-          name: v${{ env.APP_VERSION }}
+          tag_name: v${{ env.APP_VERSION }}-${{ env.SHORT_SHA }}
+          name: v${{ env.APP_VERSION }} (${{ env.SHORT_SHA }})
+          body: |
+            构建自提交: ${{ github.sha }}
           files: IPTV*.7z
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
