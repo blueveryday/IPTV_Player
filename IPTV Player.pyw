@@ -978,6 +978,8 @@ class IPTVApp(tk.Tk):
         self._closing = False
         self._player_error_cb = None
         self._closing_after_id = None
+        self._seek_status_after_id = None
+        self._video_click_after_id = None
 
         self._progress_after_id = None
         self.replay_range_start = None
@@ -1184,7 +1186,7 @@ class IPTVApp(tk.Tk):
                   font=("Microsoft YaHei UI", 11, "bold")).pack(
             anchor="w", padx=20, pady=(16, 4))
 
-        ttk.Label(win, text="GitHub 仓库（点击打开）：",
+        ttk.Label(win, text="GitHub 仓库：",
                   background=COLORS["bg_panel"],
                   foreground=COLORS["fg_secondary"]).pack(
             anchor="w", padx=20, pady=(8, 2))
@@ -1235,7 +1237,7 @@ class IPTVApp(tk.Tk):
 
         wf = ttk.Frame(self.left_body, style="Panel.TFrame")
         wf.pack(fill=tk.X, padx=8, pady=(8, 2))
-        ttk.Label(wf, text="WebDAV", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(wf, text="快捷菜单", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 6))
         self.webdav_var = tk.StringVar()
         self.webdav_cb = ttk.Combobox(wf, textvariable=self.webdav_var,
                               state="readonly", width=1)
@@ -1294,6 +1296,7 @@ class IPTVApp(tk.Tk):
 
         self.video = tk.Frame(mid, bg=COLORS["bg_video"])
         self.video.grid(row=0, column=0, sticky="nsew", padx=4, pady=(6, 3))
+        self.video.bind("<Button-1>", self._on_video_click)
         self.video.bind("<Double-Button-1>", self._on_video_double_click)
         self.video.bind("<Button-3>", self._on_video_right_click)
 
@@ -1411,6 +1414,9 @@ class IPTVApp(tk.Tk):
         self.bind("<F3>", lambda e: self.toggle_right())
         self.bind("<Escape>", self.on_escape)
 
+        self.bind("<space>", self._on_space_key)
+        self.bind("<KP_Space>", self._on_space_key)
+
         self.bind("<Left>", self._on_arrow_left)
         self.bind("<Right>", self._on_arrow_right)
         self.bind("<Up>", self._on_arrow_up)
@@ -1446,7 +1452,7 @@ class IPTVApp(tk.Tk):
             cls = w.winfo_class()
         except Exception:
             return False
-        return cls in ("TEntry", "Entry", "TCombobox", "Text",
+        return cls in ("TEntry", "Entry", "Text",
                        "TScale", "TSpinbox", "Spinbox")
 
     def _is_local_media(self, ch):
@@ -1820,42 +1826,108 @@ class IPTVApp(tk.Tk):
             self.seek_bar.set_value(0)
             self.time_var.set("--:--:-- / --:--:--")
 
+    def _cancel_seek_status_timer(self):
+        if self._seek_status_after_id is not None:
+            try:
+                self.after_cancel(self._seek_status_after_id)
+            except Exception:
+                pass
+            self._seek_status_after_id = None
+
+    def _flash_seek_status(self, text):
+        """临时显示 seek 提示，5 秒后恢复为“正在播放”信息。"""
+        self._cancel_seek_status_timer()
+        self.status_var.set(text)
+        self._seek_status_after_id = self.after(5000, self._restore_play_status)
+
+    def _restore_play_status(self):
+        self._seek_status_after_id = None
+        if getattr(self, "_closing", False):
+            return
+        if not self.current_url:
+            return
+        if self._is_file_playback():
+            self.status_var.set("正在播放：%s  %s" % (
+                self.current_title, self.current_url))
+        else:
+            self.status_var.set("正在播放：%s" % self.current_title)
+
     def _seek_local_media(self, value, phase):
         if self.player is None:
+            if phase == "commit":
+                self.status_var.set("当前使用外部播放器，无法在程序内拖动进度")
             return
         try:
             length = self.player.get_length()
         except Exception:
             return
         if not length or length <= 0:
+            if phase == "commit":
+                self.status_var.set("媒体长度尚未就绪，暂时无法拖动")
             return
+
         target_ms = int(length * float(value) / 1000.0)
         target_ms = max(0, min(length, target_ms))
+
         if phase == "preview":
             self.time_var.set("%s / %s" % (fmt_ms(target_ms), fmt_ms(length)))
             return
+
         try:
-            self.player.set_time(target_ms)
+            if not self.player.is_seekable():
+                self.status_var.set("该媒体不支持跳转")
+                return
         except Exception:
             pass
+
+        try:
+            ret = self.player.set_time(target_ms)
+        except Exception as e:
+            self.status_var.set("拖动失败：%s" % e)
+            return
+        if ret == -1:
+            self.status_var.set("VLC 拒绝跳转")
+            return
         self.time_var.set("%s / %s" % (fmt_ms(target_ms), fmt_ms(length)))
+        self._flash_seek_status("已跳转到 %s" % fmt_ms(target_ms))
 
     def _seek_local_media_relative(self, delta_ms):
         if self.player is None:
+            self.status_var.set("当前使用外部播放器，无法在程序内快进/快退")
             return
         try:
             t = self.player.get_time()
             l = self.player.get_length()
-        except Exception:
+        except Exception as e:
+            self.status_var.set("读取进度失败：%s" % e)
             return
+
         if not l or l <= 0:
+            self.status_var.set("媒体长度尚未就绪或不可 seek，请稍候再试")
             return
-        nt = max(0, min(l, t + delta_ms))
+        if t < 0:
+            t = 0
+
+        nt = max(0, min(l, t + int(delta_ms)))
+
         try:
-            self.player.set_time(nt)
+            if not self.player.is_seekable():
+                self.status_var.set("该媒体不支持跳转（常见于未开启 Range 的 WebDAV）")
+                return
         except Exception:
             pass
+
+        try:
+            ret = self.player.set_time(nt)
+        except Exception as e:
+            self.status_var.set("跳转失败：%s" % e)
+            return
+        if ret == -1:
+            self.status_var.set("VLC 拒绝跳转（媒体可能尚未完全索引）")
+            return
+
         self.time_var.set("%s / %s" % (fmt_ms(nt), fmt_ms(l)))
+        self._flash_seek_status("已跳转到 %s" % fmt_ms(nt))
 
     def _update_progress(self):
         self._progress_after_id = None
@@ -2623,8 +2695,9 @@ class IPTVApp(tk.Tk):
         try:
             media = self.vlc_instance.media_new(url)
             media.add_option(":http-reconnect=true")
+            media.add_option(":http-continuous")
             media.add_option(":avcodec-hw=%s" %
-                             ("any" if self.cfg.get("hw_decode", True) else "none"))
+                            ("any" if self.cfg.get("hw_decode", True) else "none"))
             self.player.set_media(media)
             self.player.play()
             self.player.audio_set_volume(self.vol_var.get())
@@ -2917,6 +2990,7 @@ class IPTVApp(tk.Tk):
                 "%s\n\n可稍后重试（文件 → 下载免安装 VLC 组件），或在“回看参数设置”里指定 PotPlayer 等外部播放器。" % msg)
 
     def _play_local_file(self, path, title):
+        self._cancel_seek_status_timer()
         self.current_url = path
         self.current_title = title
         self.current_live = False
@@ -2933,17 +3007,20 @@ class IPTVApp(tk.Tk):
 
         media = None
         try:
-            media = self.vlc_instance.media_new_path(path)
-        except Exception as e:
-            print("[play] media_new_path failed:", e)
+            media = self.vlc_instance.media_new(self._path_to_mrl(path))
+        except Exception:
+            pass
 
         if media is None or not media.get_mrl():
+            if media is not None:
+                try:
+                    media.release()
+                except Exception:
+                    pass
             try:
-                mrl = self._path_to_mrl(path)
-                media = self.vlc_instance.media_new(mrl)
-                print("[play] fallback media_new:", mrl)
-            except Exception as e:
-                print("[play] media_new fallback failed:", e)
+                media = self.vlc_instance.media_new_path(path)
+            except Exception:
+                media = None
 
         if media is None:
             self.status_var.set("VLC 无法识别该文件：%s" % path)
@@ -2981,6 +3058,7 @@ class IPTVApp(tk.Tk):
         return "file://" + urllib.parse.quote(p, safe="/:")
 
     def play_url(self, url, title, live=True):
+        self._cancel_seek_status_timer()
         if is_local_media_file(url):
             self._play_local_file(url, title)
             return
@@ -3170,10 +3248,21 @@ class IPTVApp(tk.Tk):
                 "开" if self.cfg["rtsp_tcp"] else "关", self.current_title))
 
     def toggle_pause(self):
-        if self.player is not None:
+        if self.player is None:
+            return
+        try:
+            st = self.player.get_state()
+        except Exception:
+            return
+        if st in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
+            return
+        try:
             self.player.pause()
+        except Exception:
+            pass
 
     def stop(self):
+        self._cancel_seek_status_timer()
         if self.player is not None:
             self.player.stop()
         self.kill_external()
@@ -3236,8 +3325,38 @@ class IPTVApp(tk.Tk):
         self._apply_right_visible()
         self.cfg["right_visible"] = self.right_visible
 
+    def _on_video_click(self, event=None):
+        if self._video_click_after_id is not None:
+            try:
+                self.after_cancel(self._video_click_after_id)
+            except Exception:
+                pass
+        self._video_click_after_id = self.after(220, self._fire_video_click)
+        return "break"
+
+    def _fire_video_click(self):
+        self._video_click_after_id = None
+        if getattr(self, "_closing", False):
+            return
+        self.toggle_pause()
+
     def _on_video_double_click(self, event=None):
+        if self._video_click_after_id is not None:
+            try:
+                self.after_cancel(self._video_click_after_id)
+            except Exception:
+                pass
+            self._video_click_after_id = None
         self.toggle_fullscreen()
+        return "break"
+
+    def _on_space_key(self, event=None):
+        if self._focus_is_text_input():
+            return None
+        if self.player is None:
+            return None
+        self.toggle_pause()
+        return "break"
 
     def toggle_fullscreen(self):
         if self.fullscreen:
@@ -3363,6 +3482,7 @@ class IPTVApp(tk.Tk):
         center_window(win, self)
 
     def on_close(self):
+        self._cancel_seek_status_timer()
         if getattr(self, "_closing", False):
             return
         self._closing = True
@@ -3383,6 +3503,13 @@ class IPTVApp(tk.Tk):
             except Exception:
                 pass
             self._closing_after_id = None
+
+        if self._video_click_after_id is not None:
+            try:
+                self.after_cancel(self._video_click_after_id)
+            except Exception:
+                pass
+            self._video_click_after_id = None
 
         self.save_config()
 
