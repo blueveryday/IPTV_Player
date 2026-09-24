@@ -23,7 +23,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta, timezone
 
-CODE_VERSION = "IPTV Player v2026.09.23"
+CODE_VERSION = "IPTV Player v2026.09.24"
 
 PY_BITS = struct.calcsize("P") * 8
 SEEK_GRANULARITY = 5
@@ -980,6 +980,7 @@ class IPTVApp(tk.Tk):
         self._closing_after_id = None
         self._seek_status_after_id = None
         self._video_click_after_id = None
+        self._net_paused = False
 
         self._progress_after_id = None
         self.replay_range_start = None
@@ -2681,6 +2682,7 @@ class IPTVApp(tk.Tk):
             url = urllib.parse.urlunparse(
                 (p.scheme, netloc, p.path, p.params, p.query, p.fragment))
 
+        self._net_paused = False
         self.current = item
         self.current_url = url
         self.current_title = "[WebDAV] " + item.get("raw_name", item["name"])
@@ -2991,6 +2993,7 @@ class IPTVApp(tk.Tk):
 
     def _play_local_file(self, path, title):
         self._cancel_seek_status_timer()
+        self._net_paused = False
         self.current_url = path
         self.current_title = title
         self.current_live = False
@@ -3059,6 +3062,7 @@ class IPTVApp(tk.Tk):
 
     def play_url(self, url, title, live=True):
         self._cancel_seek_status_timer()
+        self._net_paused = False
         if is_local_media_file(url):
             self._play_local_file(url, title)
             return
@@ -3256,13 +3260,39 @@ class IPTVApp(tk.Tk):
             return
         if st in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
             return
-        try:
-            self.player.pause()
-        except Exception:
-            pass
+
+        if self._is_file_playback():
+            try:
+                self.player.pause()
+            except Exception:
+                pass
+            return
+
+        if self._net_paused:
+            self._net_paused = False
+            url = self.current_url
+            title = self.current_title
+            live = self.current_live
+            if not url:
+                return
+            try:
+                self.player.stop()
+            except Exception:
+                pass
+            self.play_url(url, title, live=live)
+            if live:
+                self._refresh_live_bar()
+        else:
+            try:
+                self.player.pause()
+            except Exception:
+                pass
+            self._net_paused = True
+            self.status_var.set("已暂停（再按空格 / 点击画面继续）")
 
     def stop(self):
         self._cancel_seek_status_timer()
+        self._net_paused = False
         if self.player is not None:
             self.player.stop()
         self.kill_external()
