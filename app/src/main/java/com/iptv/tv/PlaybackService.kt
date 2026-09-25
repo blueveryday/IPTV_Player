@@ -326,7 +326,7 @@ class PlaybackService : Service() {
             .setContentTitle(currentTitle)
             .setContentText(if (isPaused) "已暂停" else "正在播放")
             .setSubText("IPTV Player")
-            .setSmallIcon(R.drawable.ic_notification)   // 单色白色小图标
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(contentIntent)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setOngoing(mediaPlayer.isPlaying)
