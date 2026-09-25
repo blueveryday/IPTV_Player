@@ -11,7 +11,33 @@ import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 
-data class Channel(val name: String, val url: String)
+data class Channel(
+    val name: String,
+    val url: String,
+    val local: Boolean = false,
+    val webdav: Boolean = false,
+    val isDir: Boolean = false,
+    val isBack: Boolean = false,
+    val exitBrowse: Boolean = false,
+    val rawName: String = "",
+    val path: String = "",
+    val webdavUser: String = "",
+    val webdavPass: String = ""
+)
+
+// 本地/WebDAV 媒体文件后缀，与 Python 版 MEDIA_EXTS / AUDIO_EXTS 一致
+val MEDIA_EXTS = setOf(
+    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ts", "m4v",
+    "mpg", "mpeg", "m2ts", "mts", "3gp", "rmvb", "rm", "vob", "ogv",
+    "mp3", "aac", "flac", "wav", "ape", "ogg", "wma", "m4a", "opus",
+    "ac3", "dts", "aiff", "aif", "alac", "mka", "mp2", "mpc", "wv"
+)
+val AUDIO_EXTS = setOf(
+    "mp3", "aac", "flac", "wav", "ape", "ogg", "wma", "m4a", "opus",
+    "ac3", "dts", "aiff", "aif", "alac", "mka", "mp2", "mpc", "wv"
+)
+fun isMediaName(name: String): Boolean = MEDIA_EXTS.contains(name.substringAfterLast('.', "").lowercase())
+fun isAudioName(name: String): Boolean = AUDIO_EXTS.contains(name.substringAfterLast('.', "").lowercase())
 
 fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
@@ -38,7 +64,8 @@ class Config(private val file: File) {
             "epg_threads" to 1,
             "epg_timeout" to 10,
             "m3u_path" to "",
-            "m3u_url" to ""
+            "m3u_url" to "",
+            "webdav_sources" to emptyList<Any>()
         )
     }
 
@@ -58,6 +85,15 @@ class Config(private val file: File) {
     fun s(k: String): String = j.optString(k, "")
     fun i(k: String): Int = j.optInt(k, 0)
     fun b(k: String, def: Boolean = true): Boolean = j.optBoolean(k, def)
+
+    fun webdavSources(): List<JSONObject> {
+        val arr = j.optJSONArray("webdav_sources") ?: JSONArray()
+        return (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+    }
+
+    fun setWebdavSources(list: List<JSONObject>) {
+        j.put("webdav_sources", JSONArray(list))
+    }
 
     fun replayKeys(): List<String> {
         val v = j.opt("http_replay_keys")

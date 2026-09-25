@@ -29,7 +29,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: IPTV-Player-v${{ env.VER }}
+          name: IPTV-Player_Android_v${{ env.VER }}
           path: app/build/outputs/apk/release/*.apk
 
       - name: upload Releases
