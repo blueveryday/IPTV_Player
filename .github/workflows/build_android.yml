@@ -15,7 +15,7 @@ jobs:
       - name: Calculate version number
         run: echo "VER=$(TZ=Asia/Shanghai date +%y.%m.%d)" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17
@@ -29,7 +29,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: IPTV-Player-v${{ env.VER }}
+          name: IPTV-Player_Android_v${{ env.VER }}
           path: app/build/outputs/apk/release/*.apk
 
       - name: upload Releases
@@ -38,11 +38,19 @@ jobs:
         run: |
           set -e
           TAG="v${VER}"
-          APK="app/build/outputs/apk/release/IPTV Player ${TAG}.apk"
-          test -f "$APK"
-          # 同一天重复编译：先删掉旧的 Release 和 tag，再按本次提交重新创建
+
+          echo "=== APK 目录内容 ==="
+          ls -la app/build/outputs/apk/release/
+          APK=$(ls app/build/outputs/apk/release/*.apk 2>/dev/null | head -n1)
+          if [ -z "$APK" ]; then
+            echo "❌ 没有找到 APK"
+            exit 1
+          fi
+          echo "✅ 找到 APK：$APK"
+
           gh release delete "$TAG" --cleanup-tag --yes || true
-          gh release create "$TAG" "${APK}#IPTV Player ${TAG}.apk" \
+
+          gh release create "$TAG" "${APK}#IPTV Player_Android ${TAG}.apk" \
             --target "$GITHUB_SHA" \
-            --title "IPTV Player ${TAG}" \
-            --notes "编译日期 20${VER//./-}（北京时间），提交 ${GITHUB_SHA::7}"
+            --title "IPTV Player_Android ${TAG}" \
+            --notes "编译日期 20${VER//./-}（UTC+8），提交 ${GITHUB_SHA::7}"

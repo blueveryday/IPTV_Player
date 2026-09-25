@@ -1,7 +1,11 @@
 package com.iptv.tv
 
 import android.annotation.SuppressLint
+import android.os.IBinder
+import android.content.ServiceConnection
+import android.content.ComponentName
 import android.content.ActivityNotFoundException
+import android.content.Intent
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -9,6 +13,8 @@ import android.graphics.Color
 import android.graphics.Rect
 import android.media.AudioManager
 import android.net.Uri
+import android.os.ParcelFileDescriptor
+import android.provider.OpenableColumns
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -36,6 +42,7 @@ import org.videolan.libvlc.LibVLC
 import org.videolan.libvlc.Media
 import org.videolan.libvlc.MediaPlayer
 import org.videolan.libvlc.util.VLCVideoLayout
+import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
@@ -53,9 +60,24 @@ data class SlotItem(val label: String, val start: LocalDateTime, val end: LocalD
 
 class MainActivity : AppCompatActivity() {
 
+    // ★ 修改：后台播放服务绑定
+    private var playbackService: PlaybackService? = null
+    private var isBound = false
+
+    private val playbackConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            playbackService = (service as PlaybackService.LocalBinder).getService()
+            isBound = true
+        }
+        override fun onServiceDisconnected(name: ComponentName?) {
+            isBound = false
+            playbackService = null
+        }
+    }
+
     companion object {
         const val GITHUB_URL = "https://github.com/blueveryday/IPTV_Player"
-        const val SEEK = 5                       // 与原版 SEEK_GRANULARITY 相同
+        const val SEEK = 5
         const val WEEKDAY = "一二三四五六日"
         val RED = Color.parseColor("#ff5555")
         val GREEN = Color.parseColor("#5ecb6b")
@@ -107,8 +129,17 @@ class MainActivity : AppCompatActivity() {
     private var pendingStart: Runnable? = null
     private var resumeOnStart = false
     private var viewsAttached = false
+    private var fileMode = false
+    private var localFd: ParcelFileDescriptor? = null
 
-    // 回看状态（与原版一致）
+    // WebDAV 浏览
+    private var webdavMode = false
+    private var webdavSource: JSONObject? = null
+    private var webdavPath = ""
+    private var webdavItems: List<Channel> = emptyList()
+    private var webdavReqId = 0
+
+    // 回看状态
     private var rangeStart: LocalDateTime? = null
     private var rangeEnd: LocalDateTime? = null
     private var anchorTime: LocalDateTime? = null
@@ -127,17 +158,51 @@ class MainActivity : AppCompatActivity() {
         if (uri != null) importM3u(uri)
     }
 
+    private val pickMedia = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNullOrEmpty()) return@registerForActivityResult
+        val added = ArrayList<Channel>()
+        for (uri in uris) {
+            try { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
+            val display = queryDisplayName(uri) ?: uri.lastPathSegment ?: "未知文件"
+            val name = display.substringBeforeLast('.', display)
+            added.add(Channel(name, uri.toString(), local = true, rawName = display))
+        }
+        if (added.isEmpty()) return@registerForActivityResult
+        channels = channels + added
+        applyFilter()
+        val first = added[0]
+        val idx = filtered.indexOfFirst { it.url == first.url }
+        if (idx >= 0) { selIdx = idx; chAdapter.setSelectedPos(idx); onChannelSelect() }
+        hidePanels()
+        current = first
+        playFileMedia(first.url, "[媒体] " + first.name)
+        setStatus("已添加 ${added.size} 个媒体文件，正在播放：${first.name}")
+    }
+
+    private fun queryDisplayName(uri: Uri): String? = try {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+            if (it.moveToFirst()) it.getString(0) else null
+        }
+    } catch (_: Exception) { null }
+
+    private fun openMediaFile() {
+        try { pickMedia.launch(arrayOf("video/*", "audio/*")) }
+        catch (e: ActivityNotFoundException) {
+            alert("无法选择文件", "本机没有文件选择器")
+        }
+    }
+
     private var csvTarget: EditText? = null
     private val pickCsv = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val et = csvTarget
         if (uri == null || et == null) return@registerForActivityResult
         try {
             val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
-            val n = Epg.loadChannels(decodeAuto(bytes)).size          // 顺便校验：须含 channelcode、title 两列
+            val n = Epg.loadChannels(decodeAuto(bytes)).size
             val dst = File(filesDir, "epg_channels.csv")
             dst.writeBytes(bytes)
             et.setText(dst.path)
-            Toast.makeText(this, "已导入频道表（$n 个频道），请点“保存并下载”", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "已导入频道表（$n 个频道），请点「保存并下载」", Toast.LENGTH_LONG).show()
         } catch (e: Exception) {
             alert("导入频道表失败", e.message ?: e.toString())
         }
@@ -147,6 +212,14 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // ★ 修改：bindService 必须在 super.onCreate 之后
+        bindService(
+            Intent(this, PlaybackService::class.java),
+            playbackConnection,
+            Context.BIND_AUTO_CREATE
+        )
+
         setContentView(R.layout.activity_main)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         hideSystemBars()
@@ -228,11 +301,15 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
-        if (currentUrl.isNotEmpty()) {
+
+        // ★ 修改：音频/电台交给 PlaybackService 后台播放，不在这里停
+        val isAudio = currentUrl.isNotEmpty() && isAudioUrl(currentUrl, currentTitle)
+        if (!isAudio && currentUrl.isNotEmpty()) {
             resumeOnStart = true
             cancelPending()
             player?.stop()
         }
+
         if (viewsAttached) {
             try { player?.detachViews() } catch (_: Exception) {}
             viewsAttached = false
@@ -245,7 +322,10 @@ class MainActivity : AppCompatActivity() {
             player?.attachViews(videoLayout, null, false, false)
             viewsAttached = player != null
         }
-        if (resumeOnStart) {
+
+        // ★ 修改：音频由 Service 播放，MainActivity 不恢复
+        val isAudio = currentUrl.isNotEmpty() && isAudioUrl(currentUrl, currentTitle)
+        if (resumeOnStart && !isAudio) {
             resumeOnStart = false
             val ch = current
             val end = rangeEnd
@@ -255,23 +335,23 @@ class MainActivity : AppCompatActivity() {
                     anchorTime = cur; anchorWall = localNow()
                     playUrl(buildReplayUrl(ch.url, cur, end, cfg), currentTitle, false)
                 }
+            } else if (fileMode && currentUrl.isNotEmpty()) {
+                playFileMedia(currentUrl, currentTitle)
             } else if (currentUrl.isNotEmpty()) startMedia(currentUrl)
         }
     }
 
     override fun onDestroy() {
+        if (isBound) { unbindService(playbackConnection); isBound = false }
         epgState?.cancel = true
         cfg.save()
-        try { player?.stop(); if (viewsAttached) player?.detachViews(); player?.release(); libVlc?.release() } catch (_: Exception) {}
+        try { player?.stop(); if (viewsAttached) player?.detachViews(); player?.release(); libVlc?.release(); localFd?.close() } catch (_: Exception) {}
         super.onDestroy()
     }
 
     // ================= 触屏手势 =================
-    // 左半屏上下滑=亮度　右半屏上下滑=音量
-    // 左边缘向右滑=频道菜单　右边缘向左滑=回看菜单
-    // 单击=显示进度条/关闭面板　长按=主菜单
 
-    private var gMode = 0        // 0 未定  1 亮度  2 音量  3 左边缘  4 右边缘  5 忽略
+    private var gMode = 0
     private var gDownX = 0f
     private var gDownY = 0f
     private var gStartVal = 0f
@@ -289,7 +369,6 @@ class MainActivity : AppCompatActivity() {
         val edgeW = dp(32)
         val swipeMin = dp(48)
 
-        // 全面屏的系统返回手势会抢走屏幕边缘的滑动：把两侧边缘（中间一段）划出来留给本 App
         touchLayer.addOnLayoutChangeListener { v, l, t, r, b, _, _, _, _ ->
             val w = r - l
             val h = b - t
@@ -390,7 +469,7 @@ class MainActivity : AppCompatActivity() {
     private fun isCenter(k: Int) = k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER || k == KeyEvent.KEYCODE_NUMPAD_ENTER
 
     override fun onKeyDown(keyCode: Int, ev: KeyEvent): Boolean {
-        val step = SEEK * (1 + min(ev.repeatCount / 4, 12))   // 长按加速，仍是 5 秒的整数倍
+        val step = SEEK * (1 + min(ev.repeatCount / 4, 12))
         when (keyCode) {
             KeyEvent.KEYCODE_MENU -> { showMenu(); return true }
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE -> { togglePause(); return true }
@@ -490,7 +569,7 @@ class MainActivity : AppCompatActivity() {
                 f.parentFile?.mkdirs()
                 assets.open("channel_epg_chongqing.csv").use { i -> f.outputStream().use { o -> i.copyTo(o) } }
             }
-        } catch (_: Exception) { /* 没有内置也没关系，可在“EPG 参数”里指定 */ }
+        } catch (_: Exception) { }
     }
 
     private fun loadDefault() {
@@ -503,7 +582,7 @@ class MainActivity : AppCompatActivity() {
             assets.open("iptv.m3u").use { i -> internal.outputStream().use { o -> i.copyTo(o) } }
             loadM3u(internal)
         } catch (_: Exception) {
-            setStatus("未找到 iptv.m3u。请在菜单中“打开 m3u 文件”或“从网址加载 m3u”，或用 adb 放到 ${ext?.path}")
+            setStatus("未找到 iptv.m3u。请在菜单中「打开 m3u 文件」或「从网址加载 m3u」，或用 adb 放到 ${ext?.path}")
         }
     }
 
@@ -531,7 +610,7 @@ class MainActivity : AppCompatActivity() {
     private fun openM3uFile() {
         try { pickM3u.launch(arrayOf("*/*")) }
         catch (e: ActivityNotFoundException) {
-            alert("无法选择文件", "本机没有文件选择器。请改用“从网址加载 m3u”，或用 adb 把 iptv.m3u 推送到：\n${getExternalFilesDir(null)?.path}")
+            alert("无法选择文件", "本机没有文件选择器。请改用「从网址加载 m3u」，或用 adb 把 iptv.m3u 推送到：\n${getExternalFilesDir(null)?.path}")
         }
     }
 
@@ -576,11 +655,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyFilter() {
         val kw = keyword.lowercase()
-        filtered = channels.filter { it.name.lowercase().contains(kw) }
+        val source = if (webdavMode) webdavItems else channels
+        filtered = if (kw.isEmpty()) source else source.filter { it.isBack || it.name.lowercase().contains(kw) }
         selIdx = -1
         chAdapter.items = filtered
         chAdapter.setSelectedPos(-1)
-        countText.text = "${filtered.size} / ${channels.size} 个频道"
+        countText.text = if (webdavMode) "${filtered.size} / ${source.size} 项" else "${filtered.size} / ${source.size} 个频道"
         searchText.text = if (keyword.isEmpty()) "" else "搜索：$keyword"
         refreshSlots()
     }
@@ -599,15 +679,23 @@ class MainActivity : AppCompatActivity() {
     private fun onChannelPicked(pos: Int) {
         selIdx = pos
         onChannelSelect()
-        hidePanels()
+        val ch = selectedChannel()
+        val isDirNav = ch != null && ch.webdav && (ch.isDir || ch.exitBrowse)
+        if (!isDirNav) hidePanels()
         playLive()
     }
 
     private fun onChannelSelect() {
         val ch = selectedChannel()
         if (ch != null) {
-            val tip = if (replaySupported(ch.url, cfg)) "" else "（不支持回看）"
-            replayChText.text = "${ch.name} $tip"
+            replayChText.text = when {
+                ch.isBack -> "返回"
+                ch.webdav && ch.isDir -> "目录：${ch.rawName}"
+                ch.webdav -> "文件：${ch.rawName}"
+                ch.local -> "${ch.name} （本地媒体文件）"
+                replaySupported(ch.url, cfg) -> ch.name
+                else -> "${ch.name} （不支持回看）"
+            }
         }
         refreshSlots()
     }
@@ -619,7 +707,7 @@ class MainActivity : AppCompatActivity() {
         selIdx = idx
         chAdapter.setSelectedPos(idx)
         onChannelSelect()
-        playLive(350)
+        if (!webdavMode) playLive(350)
     }
 
     // ================= 播放 =================
@@ -644,9 +732,31 @@ class MainActivity : AppCompatActivity() {
         pendingStart = null
     }
 
+    // ★ 新增：判断是否音频/电台
+    private fun isAudioUrl(url: String, name: String = ""): Boolean {
+        if (url.isEmpty()) return false
+        val u = url.lowercase()
+        val n = name.lowercase()
+        if (u.endsWith(".mp3") || u.endsWith(".aac") || u.endsWith(".ogg")
+            || u.endsWith(".m4a") || u.endsWith(".flac") || u.endsWith(".wav")) return true
+        if (n.contains("radio") || n.contains("电台") || n.contains("广播")
+            || n.contains("fm") || n.contains("audio")) return true
+        return false
+    }
+
     private fun playUrl(url: String, title: String, live: Boolean = true, delayMs: Long = 0) {
-        currentUrl = url; currentTitle = title; currentLive = live
+        currentUrl = url; currentTitle = title; currentLive = live; fileMode = false
         cancelPending()
+
+        // ★ 修改：音频/电台 → PlaybackService 后台播放
+        if (isAudioUrl(url, title)) {
+            player?.stop()  // 停掉本地视频播放器，避免双响
+            playbackService?.play(url, title)
+            setStatus("正在后台播放：$title")
+            return
+        }
+
+        // 视频：保持原有逻辑
         if (delayMs > 0) {
             val r = Runnable { pendingStart = null; startMedia(url) }
             pendingStart = r
@@ -671,16 +781,196 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun playFileMedia(url: String, title: String) {
+        // ★ 音频文件也走 Service
+        if (isAudioUrl(url, title)) {
+            cancelPending()
+            player?.stop()
+            playbackService?.play(url, title)
+            currentUrl = url; currentTitle = title; currentLive = false; fileMode = false
+            clearReplayRange()
+            setStatus("正在后台播放：$title")
+            return
+        }
+
+        val p = player ?: run { setStatus("播放器未初始化，无法播放"); return }
+        cancelPending()
+        currentUrl = url; currentTitle = title; currentLive = false; fileMode = true
+        clearReplayRange()
+        try {
+            val media: Media = when {
+                url.startsWith("content://") -> {
+                    try { localFd?.close() } catch (_: Exception) {}
+                    val pfd = contentResolver.openFileDescriptor(Uri.parse(url), "r") ?: throw Exception("无法打开文件")
+                    localFd = pfd
+                    Media(libVlc, pfd.fileDescriptor)
+                }
+                url.startsWith("/") -> Media(libVlc, Uri.parse("file://$url"))
+                else -> Media(libVlc, Uri.parse(url)).also {
+                    if (url.lowercase().startsWith("http")) it.addOption(":http-reconnect=true")
+                }
+            }
+            media.setHWDecoderEnabled(cfg.b("hw_decode"), false)
+            p.media = media
+            media.release()
+            p.play()
+            setStatus("正在播放：$title")
+        } catch (e: Exception) {
+            setStatus("播放异常：${e.message}")
+        }
+    }
+
+    private fun playWebDavFile(ch: Channel) {
+        clearReplayRange()
+        current = ch
+        val url = webDavAuthUrl(ch.url, ch.webdavUser, ch.webdavPass)
+        playFileMedia(url, "[WebDAV] " + ch.rawName.ifEmpty { ch.name })
+    }
+
+    // ================= WebDAV 浏览 =================
+
+    private fun openWebDavDialog() {
+        val sources = cfg.webdavSources()
+        val names = sources.map { it.optString("name").ifEmpty { it.optString("url") } }.toMutableList()
+        names.add("＋ 新建 WebDAV 连接…")
+        if (sources.isNotEmpty()) names.add("－ 删除已保存的连接…")
+        AlertDialog.Builder(this).setTitle("浏览 WebDAV").setItems(names.toTypedArray()) { _, w ->
+            when {
+                w < sources.size -> enterWebDav(sources[w])
+                w == sources.size -> openWebDavForm()
+                else -> deleteWebDavSourceDialog()
+            }
+        }.setNegativeButton("取消", null).show()
+    }
+
+    private fun deleteWebDavSourceDialog() {
+        val sources = cfg.webdavSources()
+        val names = sources.map { it.optString("name").ifEmpty { it.optString("url") } }.toTypedArray()
+        val checked = BooleanArray(sources.size)
+        AlertDialog.Builder(this).setTitle("删除已保存的连接")
+            .setMultiChoiceItems(names, checked) { _, i, c -> checked[i] = c }
+            .setPositiveButton("删除") { _, _ ->
+                cfg.setWebdavSources(sources.filterIndexed { i, _ -> !checked[i] }); cfg.save()
+            }.setNegativeButton("取消", null).show()
+    }
+
+    private fun openWebDavForm() {
+        val (box, edits) = formView(
+            listOf("名称", "地址（如 http://192.168.1.10:5005/dav）", "用户名", "密码"),
+            listOf("", "", "", ""))
+        edits[3].inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        val saveBox = CheckBox(this).apply { text = "保存到配置"; isChecked = true; setTextColor(Color.WHITE) }
+        box.addView(saveBox)
+        val dlg = AlertDialog.Builder(this).setTitle("新建 WebDAV 连接").setView(ScrollView(this).apply { addView(box) })
+            .setPositiveButton("连接", null).setNegativeButton("取消", null).create()
+        dlg.show()
+        dlg.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            var url = edits[1].text.toString().trim()
+            if (url.isEmpty()) { Toast.makeText(this, "请填写 WebDAV 地址", Toast.LENGTH_SHORT).show(); return@setOnClickListener }
+            if (!url.lowercase().startsWith("http://") && !url.lowercase().startsWith("https://")) url = "http://$url"
+            val name = edits[0].text.toString().trim().ifEmpty { url }
+            val user = edits[2].text.toString().trim()
+            val pass = edits[3].text.toString()
+            val entry = JSONObject().apply { put("name", name); put("url", url); put("user", user); put("password", pass) }
+            if (saveBox.isChecked) {
+                val list = cfg.webdavSources().toMutableList()
+                val i = list.indexOfFirst { it.optString("name") == name }
+                if (i >= 0) list[i] = entry else list.add(entry)
+                cfg.setWebdavSources(list); cfg.save()
+            }
+            dlg.dismiss()
+            enterWebDav(entry)
+        }
+    }
+
+    private fun enterWebDav(source: JSONObject) {
+        webdavMode = true; webdavSource = source; webdavPath = ""
+        keyword = ""; searchText.text = ""
+        setStatus("正在连接 WebDAV：${source.optString("url")}")
+        navigateWebDav("")
+    }
+
+    private fun exitWebDav() {
+        if (!webdavMode) return
+        webdavMode = false; webdavSource = null; webdavPath = ""; webdavItems = emptyList()
+        applyFilter()
+        setStatus("已退出 WebDAV 浏览")
+    }
+
+    private fun navigateWebDav(path: String) {
+        val src = webdavSource ?: return
+        webdavReqId++
+        val reqId = webdavReqId
+        val url = src.optString("url"); val user = src.optString("user"); val pass = src.optString("password")
+        setStatus("正在加载 WebDAV 目录：${path.ifEmpty { "/" }}")
+        Thread {
+            try {
+                val entries = WebDavClient(url, user, pass).list(path)
+                ui.post { onWebDavLoaded(reqId, path, entries, user, pass) }
+            } catch (e: Exception) {
+                ui.post {
+                    if (reqId == webdavReqId) {
+                        setStatus("WebDAV 加载失败：${e.message}")
+                        alert("WebDAV 错误", "无法读取目录：${path.ifEmpty { "/" }}\n\n${e.message}")
+                    }
+                }
+            }
+        }.start()
+    }
+
+    private fun onWebDavLoaded(reqId: Int, path: String, entries: List<WebDavEntry>, user: String, pass: String) {
+        if (reqId != webdavReqId) return
+        webdavPath = path
+        val items = ArrayList<Channel>()
+        items.add(
+            if (path.isNotEmpty()) Channel("⬅ 返回上级", "", webdav = true, isDir = true, isBack = true, path = path.substringBeforeLast('/', ""))
+            else Channel("⬅ 退出 WebDAV 浏览", "", webdav = true, isDir = true, isBack = true, exitBrowse = true)
+        )
+        val dirs = entries.filter { it.isDir }.sortedBy { it.name.lowercase() }
+        val files = entries.filter { !it.isDir && isMediaName(it.name) }.sortedBy { it.name.lowercase() }
+        for (d in dirs) {
+            val childPath = if (path.isEmpty()) d.name else "$path/${d.name}"
+            items.add(Channel("📁 " + d.name, d.url, webdav = true, isDir = true, rawName = d.name, path = childPath, webdavUser = user, webdavPass = pass))
+        }
+        for (f in files) {
+            val childPath = if (path.isEmpty()) f.name else "$path/${f.name}"
+            val mark = if (isAudioName(f.name)) "🎵 " else "🎬 "
+            items.add(Channel(mark + f.name, f.url, webdav = true, isDir = false, rawName = f.name, path = childPath, webdavUser = user, webdavPass = pass))
+        }
+        webdavItems = items
+        applyFilter()
+        setStatus("WebDAV ${path.ifEmpty { "/" }}：${dirs.size} 个子目录，${files.size} 个媒体文件")
+    }
+
     private fun playLive(delayMs: Long = 0) {
         val ch = selectedChannel()
         if (ch == null) { Toast.makeText(this, "请先选择频道", Toast.LENGTH_SHORT).show(); return }
+        if (ch.webdav) {
+            when {
+                ch.exitBrowse -> exitWebDav()
+                ch.isDir -> navigateWebDav(ch.path)
+                else -> playWebDavFile(ch)
+            }
+            return
+        }
         clearReplayRange()
         current = ch
-        playUrl(ch.url, "[直播] " + ch.name, true, delayMs)
-        refreshLiveBar()
+        if (ch.local) {
+            playFileMedia(ch.url, "[媒体] " + ch.name)
+        } else {
+            playUrl(ch.url, "[直播] " + ch.name, true, delayMs)
+            refreshLiveBar()
+        }
     }
 
     private fun togglePause() {
+        // ★ 修改：音频/电台通过 Service 控制
+        val isAudio = currentUrl.isNotEmpty() && isAudioUrl(currentUrl, currentTitle)
+        if (isAudio && playbackService != null) {
+            if (playbackService?.isPlaying() == true) playbackService?.pause()
+            else playbackService?.resume()
+            return
+        }
         val p = player ?: return
         if (p.isPlaying) p.pause() else p.play()
     }
@@ -688,6 +978,11 @@ class MainActivity : AppCompatActivity() {
     private fun stopPlay() {
         cancelPending()
         player?.stop()
+        // ★ 修改：同时停止后台 Service
+        try { playbackService?.stop() } catch (_: Exception) {}
+        try { localFd?.close() } catch (_: Exception) {}
+        localFd = null
+        fileMode = false
         clearReplayRange()
         current = null
         currentUrl = ""
@@ -705,7 +1000,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ================= 回看 / 进度（移植自原版） =================
+    // ================= 回看 / 进度 =================
 
     private fun localNow(): LocalDateTime = LocalDateTime.now(ZoneOffset.UTC).plusHours(cfg.i("tz_offset").toLong())
     private fun secs(a: LocalDateTime, b: LocalDateTime): Double = Duration.between(a, b).toMillis() / 1000.0
@@ -738,11 +1033,30 @@ class MainActivity : AppCompatActivity() {
         timeText.text = "$n / $n"
     }
 
+    private fun fmtMs(ms: Long): String {
+        val s = max(0, ms) / 1000
+        return "%02d:%02d:%02d".format(s / 3600, (s % 3600) / 60, s % 60)
+    }
+
+    private fun updateFileProgress() {
+        val p = player
+        val len = p?.length ?: -1L
+        if (p != null && len > 0) {
+            seekBar.seekEnabled = true
+            seekBar.setValue((p.time * 1000.0 / len).coerceIn(0.0, 1000.0))
+            timeText.text = "${fmtMs(p.time)} / ${fmtMs(len)}"
+        } else {
+            seekBar.seekEnabled = false; seekBar.setValue(0.0); timeText.text = "--:--:-- / --:--:--"
+        }
+    }
+
     private fun updateProgress() {
         try {
             val rs = rangeStart
             val re0 = rangeEnd
             if (seekBar.dragging) {
+            } else if (fileMode) {
+                updateFileProgress()
             } else if (currentLive && rs == null) {
                 if (current != null) refreshLiveBar()
                 else { seekBar.seekEnabled = false; seekBar.setValue(0.0); timeText.text = "--:--:-- / --:--:--" }
@@ -781,6 +1095,7 @@ class MainActivity : AppCompatActivity() {
     private fun arrowLeft(step: Int = SEEK) {
         if (seekBar.dragging) return
         showBar()
+        if (fileMode) { seekFileRelative(-step * 1000L); return }
         if (currentLive) { liveRewindStart(step); return }
         if (rangeStart == null || rangeEnd == null) return
         seekReplayBy(-step)
@@ -789,6 +1104,7 @@ class MainActivity : AppCompatActivity() {
     private fun arrowRight(step: Int = SEEK) {
         if (seekBar.dragging) return
         showBar()
+        if (fileMode) { seekFileRelative(step * 1000L); return }
         if (currentLive) return
         if (rangeStart == null || rangeEnd == null) return
         if (liveRewind) {
@@ -856,7 +1172,31 @@ class MainActivity : AppCompatActivity() {
         setStatus("已恢复直播：${ch.name}")
     }
 
+    private fun seekFile(value: Double, phase: String) {
+        val p = player ?: return
+        val len = p.length
+        if (len <= 0) { if (phase == "commit") setStatus("媒体长度尚未就绪，暂时无法拖动"); return }
+        val target = (len * value / 1000.0).toLong().coerceIn(0, len)
+        if (phase == "preview") { timeText.text = "${fmtMs(target)} / ${fmtMs(len)}"; return }
+        if (!p.isSeekable) { setStatus("该媒体不支持跳转"); return }
+        p.time = target
+        timeText.text = "${fmtMs(target)} / ${fmtMs(len)}"
+        setStatus("已跳转到 ${fmtMs(target)}")
+    }
+
+    private fun seekFileRelative(deltaMs: Long) {
+        val p = player ?: return
+        val len = p.length
+        if (len <= 0) { setStatus("媒体长度尚未就绪或不可 seek，请稍候再试"); return }
+        if (!p.isSeekable) { setStatus("该媒体不支持跳转"); return }
+        val nt = (p.time + deltaMs).coerceIn(0, len)
+        p.time = nt
+        timeText.text = "${fmtMs(nt)} / ${fmtMs(len)}"
+        setStatus("已跳转到 ${fmtMs(nt)}")
+    }
+
     private fun onSeekBar(value: Double, phase: String) {
+        if (fileMode) { seekFile(value, phase); return }
         val ch = current
         if (rangeStart == null || rangeEnd == null) {
             if (ch == null) { seekBar.setValue(if (currentLive) 1000.0 else 0.0); return }
@@ -926,6 +1266,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshSlots(keep: Boolean = false) {
+        if (webdavMode) {
+            slotAdapter.items = emptyList(); slotSel = -1; slotsLocked = true
+            epgText.text = "WebDAV 浏览模式"
+            return
+        }
+        val chLocal = selectedChannel()
+        if (chLocal != null && chLocal.local) {
+            slotAdapter.items = emptyList(); slotSel = -1; slotsLocked = true
+            epgText.text = "本地媒体文件，无回看"
+            return
+        }
         val keepItem = if (keep) slotAdapter.items.getOrNull(slotSel) else null
         val l = dateList()
         if (dateIdx !in l.indices) dateIdx = 0
@@ -1071,6 +1422,7 @@ class MainActivity : AppCompatActivity() {
             "直播当前选择的频道", "暂停 / 继续", "停止",
             "频道列表", "回看时段（节目单）",
             "打开 m3u 文件…", "从网址加载 m3u…", "重新加载 m3u",
+            "打开媒体文件…", "浏览 WebDAV…",
             "回看参数设置…", "播放选项（硬解 / RTSP-TCP）…",
             "下载 EPG", "自定义 EPG 下载参数…",
             "关于", "退出程序")
@@ -1084,12 +1436,14 @@ class MainActivity : AppCompatActivity() {
                 5 -> openM3uFile()
                 6 -> loadM3uFromUrl()
                 7 -> loadDefault()
-                8 -> openSettings()
-                9 -> openPlayOptions()
-                10 -> startEpgUpdate(false)
-                11 -> openEpgSettings()
-                12 -> showAbout()
-                13 -> finish()
+                8 -> openMediaFile()
+                9 -> openWebDavDialog()
+                10 -> openSettings()
+                11 -> openPlayOptions()
+                12 -> startEpgUpdate(false)
+                13 -> openEpgSettings()
+                14 -> showAbout()
+                15 -> finish()
             }
         }.show()
     }
@@ -1103,6 +1457,7 @@ class MainActivity : AppCompatActivity() {
         alert("关于", "${versionText()}\n\nGitHub：$GITHUB_URL\n\n" +
                 "遥控器：\n确定键=频道列表（长按=回看列表）\n上/下=换台　左/右=倒退/快进（5 秒）\n" +
                 "频道列表中 → 进入回看节目单，← 返回\n菜单键=菜单　返回键=关闭面板\n\n" +
+                "菜单里可「打开媒体文件」播放本地视频/音频，或「浏览 WebDAV」连接网络存储\n\n" +
                 "触屏：\n左半屏上下滑=亮度　右半屏上下滑=音量\n左边缘右滑=频道菜单　右边缘左滑=回看菜单\n单击=进度条/关闭面板　长按=主菜单")
     }
 
@@ -1166,7 +1521,7 @@ class MainActivity : AppCompatActivity() {
         val defs = Config.defaults()
         val (box, edits) = formView(rows.map { it.first }, rows.map { (_, k) -> cfg.s(k).ifEmpty { if (k == "epg_threads" || k == "epg_timeout") cfg.i(k).toString() else "" } })
         box.addView(TextView(this).apply {
-            text = "可用变量：{channelcode} 频道代码，{date} 按“日期格式”生成的日期。\n最终地址 = 服务器地址 + 路径模板。"
+            text = "可用变量：{channelcode} 频道代码，{date} 按「日期格式」生成的日期。\n最终地址 = 服务器地址 + 路径模板。"
             setTextColor(Color.parseColor("#9e9e9e")); textSize = 13f; setPadding(0, dp(10), 0, 0)
         })
         val pv = TextView(this).apply { setTextColor(Color.parseColor("#4a90d9")); textSize = 13f; setPadding(0, dp(6), 0, dp(6)) }
