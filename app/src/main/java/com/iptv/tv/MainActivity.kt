@@ -107,7 +107,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var epgText: TextView
     private lateinit var dateBtn: TextView
     private lateinit var btnSearch: TextView
-    private lateinit var btnMenu: TextView
+    // ★ 修改：原 btnMenu 拆分为「打开」「选项」两个一级按钮
+    private lateinit var btnOpen: TextView
+    private lateinit var btnOptions: TextView
+    private lateinit var btnExit: TextView
     private lateinit var btnReplay: TextView
     private lateinit var btnCopy: TextView
     private lateinit var chAdapter: SimpleAdapter<Channel>
@@ -246,7 +249,10 @@ class MainActivity : AppCompatActivity() {
         epgText = findViewById(R.id.epgText)
         dateBtn = findViewById(R.id.dateBtn)
         btnSearch = findViewById(R.id.btnSearch)
-        btnMenu = findViewById(R.id.btnMenu)
+        // ★ 修改：一级按钮「打开」「选项」取代原「菜单」
+        btnOpen = findViewById(R.id.btnOpen)
+        btnOptions = findViewById(R.id.btnOptions)
+        btnExit = findViewById(R.id.btnExit)
         btnReplay = findViewById(R.id.btnReplay)
         btnCopy = findViewById(R.id.btnCopy)
 
@@ -262,7 +268,10 @@ class MainActivity : AppCompatActivity() {
 
         seekBar.onSeek = { v, ph -> onSeekBar(v, ph) }
         btnSearch.setOnClickListener { openSearch() }
-        btnMenu.setOnClickListener { showMenu() }
+        // ★ 修改：一级按钮直接进入原「菜单」里的对应子菜单
+        btnOpen.setOnClickListener { showOpenMenu() }
+        btnOptions.setOnClickListener { showOptionsMenu() }
+        btnExit.setOnClickListener { finish() }
         btnReplay.setOnClickListener { playReplay() }
         btnCopy.setOnClickListener { copyReplayUrl() }
         findViewById<View>(R.id.btnEpg).setOnClickListener { showRight() }
@@ -1417,33 +1426,53 @@ class MainActivity : AppCompatActivity() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
+    // 遥控器「菜单键」/触屏长按 仍弹出汇总菜单（含「关于」入口）
     private fun showMenu() {
+        val items = arrayOf("搜索", "打开", "选项", "关于")
+        AlertDialog.Builder(this).setTitle("菜单　${versionText()}").setItems(items) { _, w ->
+            when (w) {
+                0 -> openSearch()
+                1 -> showOpenMenu()
+                2 -> showOptionsMenu()
+                3 -> showAbout()
+            }
+        }.show()
+    }
+
+    // 一级按钮「打开」的内容（即原菜单里的「打开」）
+    private fun showOpenMenu() {
+        val items = arrayOf(
+            "打开 m3u 文件…", "从网址加载 m3u…", "重新加载 m3u",
+            "打开媒体文件…", "浏览 WebDAV…")
+        AlertDialog.Builder(this).setTitle("打开").setItems(items) { _, w ->
+            when (w) {
+                0 -> openM3uFile()
+                1 -> loadM3uFromUrl()
+                2 -> loadDefault()
+                3 -> openMediaFile()
+                4 -> openWebDavDialog()
+            }
+        }.show()
+    }
+
+    // 一级按钮「选项」的内容（即原菜单里的「选项」）
+    private fun showOptionsMenu() {
         val items = arrayOf(
             "直播当前选择的频道", "暂停 / 继续", "停止",
             "频道列表", "回看时段（节目单）",
-            "打开 m3u 文件…", "从网址加载 m3u…", "重新加载 m3u",
-            "打开媒体文件…", "浏览 WebDAV…",
             "回看参数设置…", "播放选项（硬解 / RTSP-TCP）…",
-            "下载 EPG", "自定义 EPG 下载参数…",
-            "关于", "退出程序")
-        AlertDialog.Builder(this).setTitle("菜单　${versionText()}").setItems(items) { _, w ->
+            "下载 EPG", "自定义 EPG 下载参数…")
+        AlertDialog.Builder(this).setTitle("选项").setItems(items) { _, w ->
             when (w) {
                 0 -> { hidePanels(); playLive() }
                 1 -> togglePause()
                 2 -> stopPlay()
                 3 -> showLeft()
                 4 -> showRight()
-                5 -> openM3uFile()
-                6 -> loadM3uFromUrl()
-                7 -> loadDefault()
-                8 -> openMediaFile()
-                9 -> openWebDavDialog()
-                10 -> openSettings()
-                11 -> openPlayOptions()
-                12 -> startEpgUpdate(false)
-                13 -> openEpgSettings()
-                14 -> showAbout()
-                15 -> finish()
+                5 -> openSettings()
+                6 -> openPlayOptions()
+                7 -> startEpgUpdate(false)
+                8 -> openEpgSettings()
             }
         }.show()
     }

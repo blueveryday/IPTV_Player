@@ -88,7 +88,7 @@
 
     <LinearLayout
         android:id="@+id/leftPanel"
-        android:layout_width="260dp"
+        android:layout_width="300dp"
         android:layout_height="match_parent"
         android:background="@drawable/panel_bg"
         android:clickable="true"
@@ -114,28 +114,43 @@
                 android:padding="10dp"
                 android:text="搜索"
                 android:textColor="#e0e0e0"
-                android:textSize="18sp" />
+                android:textSize="14sp" />
 
             <TextView
-                android:id="@+id/btnMenu"
+                android:id="@+id/btnOpen"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
+                android:layout_marginStart="6dp"
                 android:layout_weight="1"
                 android:background="@drawable/item_bg"
                 android:clickable="true"
                 android:focusable="true"
                 android:gravity="center"
                 android:padding="10dp"
-                android:text="菜单"
+                android:text="打开"
                 android:textColor="#e0e0e0"
-                android:textSize="18sp" />
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/btnOptions"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:layout_weight="1"
+                android:background="@drawable/item_bg"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:padding="10dp"
+                android:text="选项"
+                android:textColor="#e0e0e0"
+                android:textSize="14sp" />
 
             <TextView
                 android:id="@+id/btnEpg"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
+                android:layout_marginStart="6dp"
                 android:layout_weight="1"
                 android:background="@drawable/item_bg"
                 android:clickable="true"
@@ -144,7 +159,22 @@
                 android:padding="10dp"
                 android:text="回看"
                 android:textColor="#e0e0e0"
-                android:textSize="18sp" />
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/btnExit"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="6dp"
+                android:layout_weight="1"
+                android:background="@drawable/item_bg"
+                android:clickable="true"
+                android:focusable="true"
+                android:gravity="center"
+                android:padding="10dp"
+                android:text="退出"
+                android:textColor="#e0e0e0"
+                android:textSize="14sp" />
         </LinearLayout>
 
         <TextView
