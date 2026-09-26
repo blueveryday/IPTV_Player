@@ -1417,36 +1417,55 @@ class MainActivity : AppCompatActivity() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-    private fun showMenu() {
-        val items = arrayOf(
-            "直播当前选择的频道", "暂停 / 继续", "停止",
-            "频道列表", "回看时段（节目单）",
-            "打开 m3u 文件…", "从网址加载 m3u…", "重新加载 m3u",
-            "打开媒体文件…", "浏览 WebDAV…",
-            "回看参数设置…", "播放选项（硬解 / RTSP-TCP）…",
-            "下载 EPG", "自定义 EPG 下载参数…",
-            "关于", "退出程序")
-        AlertDialog.Builder(this).setTitle("菜单　${versionText()}").setItems(items) { _, w ->
-            when (w) {
-                0 -> { hidePanels(); playLive() }
-                1 -> togglePause()
-                2 -> stopPlay()
-                3 -> showLeft()
-                4 -> showRight()
-                5 -> openM3uFile()
-                6 -> loadM3uFromUrl()
-                7 -> loadDefault()
-                8 -> openMediaFile()
-                9 -> openWebDavDialog()
-                10 -> openSettings()
-                11 -> openPlayOptions()
-                12 -> startEpgUpdate(false)
-                13 -> openEpgSettings()
-                14 -> showAbout()
-                15 -> finish()
-            }
-        }.show()
-    }
+private fun showMenu() {
+    val items = arrayOf("搜索", "打开", "选项", "关于")
+    AlertDialog.Builder(this).setTitle("菜单　${versionText()}").setItems(items) { _, w ->
+        when (w) {
+            0 -> openSearch()
+            1 -> showOpenMenu()
+            2 -> showOptionsMenu()
+            3 -> showAbout()
+        }
+    }.show()
+}
+
+	private fun showOpenMenu() {
+		val items = arrayOf(
+			"打开 m3u 文件…", "从网址加载 m3u…", "重新加载 m3u",
+			"打开媒体文件…", "浏览 WebDAV…")
+		AlertDialog.Builder(this).setTitle("打开").setItems(items) { _, w ->
+			when (w) {
+				0 -> openM3uFile()
+				1 -> loadM3uFromUrl()
+				2 -> loadDefault()
+				3 -> openMediaFile()
+				4 -> openWebDavDialog()
+			}
+		}.show()
+	}
+
+	private fun showOptionsMenu() {
+		val items = arrayOf(
+			"直播当前选择的频道", "暂停 / 继续", "停止",
+			"频道列表", "回看时段（节目单）",
+			"回看参数设置…", "播放选项（硬解 / RTSP-TCP）…",
+			"下载 EPG", "自定义 EPG 下载参数…",
+			"退出程序")
+		AlertDialog.Builder(this).setTitle("选项").setItems(items) { _, w ->
+			when (w) {
+				0 -> { hidePanels(); playLive() }
+				1 -> togglePause()
+				2 -> stopPlay()
+				3 -> showLeft()
+				4 -> showRight()
+				5 -> openSettings()
+				6 -> openPlayOptions()
+				7 -> startEpgUpdate(false)
+				8 -> openEpgSettings()
+				9 -> finish()
+			}
+		}.show()
+	}
 
     private fun versionText(): String {
         val v = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { null }
