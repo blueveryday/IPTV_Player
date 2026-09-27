@@ -85,12 +85,50 @@ jobs:
           Write-Host "vlc_module 精简后大小: $mb MB"
           echo "DIST_DIR=$($dist.FullName)" >> $env:GITHUB_ENV
 
-      - name: Smoke test (启动 10 秒，确认没有闪退)
+      - name: Bundle ffmpeg / ffprobe
+        shell: pwsh
+        env:
+          FFMPEG_VERSION: "8.1.2"
+        run: |
+          $url = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-$env:FFMPEG_VERSION-essentials_build.7z"
+          $archive = Join-Path $env:RUNNER_TEMP "ffmpeg.7z"
+          $extractDir = Join-Path $env:RUNNER_TEMP "ffmpeg_extracted"
+
+          Write-Host "正在下载 FFmpeg $env:FFMPEG_VERSION ..."
+          Write-Host "地址: $url"
+          Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+
+          Write-Host "正在解压..."
+          if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+          New-Item -ItemType Directory -Path $extractDir | Out-Null
+
+          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) { $sevenZip = "C:\Program Files\7-Zip\7z.exe" }
+          if (-not (Test-Path $sevenZip)) { throw "未找到 7z，无法解压 .7z 文件" }
+
+          & $sevenZip x $archive "-o$extractDir" -y
+          if ($LASTEXITCODE -ne 0) { throw "7z 解压失败，退出码 $LASTEXITCODE" }
+
+          $ffmpeg = Get-ChildItem -Path $extractDir -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+          $ffprobe = Get-ChildItem -Path $extractDir -Recurse -Filter "ffprobe.exe" | Select-Object -First 1
+
+          if (-not $ffmpeg) { throw "压缩包中未找到 ffmpeg.exe" }
+          if (-not $ffprobe) { throw "压缩包中未找到 ffprobe.exe" }
+
+          Copy-Item $ffmpeg.FullName -Destination $env:DIST_DIR -Force
+          Copy-Item $ffprobe.FullName -Destination $env:DIST_DIR -Force
+
+          $sizeMb = [math]::Round(
+            ((Get-Item (Join-Path $env:DIST_DIR "ffmpeg.exe")).Length +
+             (Get-Item (Join-Path $env:DIST_DIR "ffprobe.exe")).Length) / 1MB, 1)
+          Write-Host "已放入 $env:DIST_DIR：ffmpeg.exe + ffprobe.exe，共 $sizeMb MB"
+
+      - name: Smoke test (启动 15 秒，确认没有闪退)
         shell: pwsh
         run: |
           $exe = Join-Path $env:DIST_DIR "IPTV Player.exe"
           $p = Start-Process -FilePath $exe -WorkingDirectory $env:DIST_DIR -PassThru
-          Start-Sleep -Seconds 10
+          Start-Sleep -Seconds 15
           if ($p.HasExited) {
             throw "程序启动后立即退出（退出码 $($p.ExitCode)），可能缺少模块或文件"
           }
@@ -127,6 +165,10 @@ jobs:
           name: v${{ env.APP_VERSION }} (${{ env.SHORT_SHA }})
           body: |
             构建自提交: ${{ github.sha }}
+
+            本发行版已内置：
+            - VLC 运行时组件（vlc_module/）
+            - FFmpeg / FFprobe（LGPL/GPL，来自 https://www.gyan.dev/ffmpeg/builds/）
           files: IPTV*.7z
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

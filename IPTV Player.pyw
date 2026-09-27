@@ -19,11 +19,13 @@ import urllib.error
 import base64
 import xml.etree.ElementTree as ET
 import webbrowser
+import http.server
+import socketserver
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta, timezone
 
-CODE_VERSION = "IPTV Player v2026.09.24"
+CODE_VERSION = "IPTV Player v2026.09.27"
 
 PY_BITS = struct.calcsize("P") * 8
 SEEK_GRANULARITY = 5
@@ -62,7 +64,13 @@ COLORS = {
     "btn_active":   "#454545",
     "status_bg":    "#2d2d30",
     "live_green":   "#5ecb6b",
+    "rec_red":      "#ff3b30",
 }
+
+MENU_CHECK_FG = "#ffffff"
+MENU_CHECK_ACTIVE_FG = "#000000"
+
+MP3_BITRATES = (32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320)
 
 
 def center_window(win, parent=None):
@@ -278,6 +286,456 @@ APP_DIR = app_dir()
 DEFAULT_M3U = os.path.join(APP_DIR, "iptv.m3u")
 CONFIG_FILE = os.path.join(APP_DIR, "iptv_config.json")
 
+RECORD_DIR = os.path.join(APP_DIR, "recode")
+
+
+def find_ffmpeg():
+    exe = "ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg"
+    cands = [
+        os.path.join(APP_DIR, exe),
+        os.path.join(APP_DIR, "ffmpeg", exe),
+        os.path.join(APP_DIR, "ffmpeg", "bin", exe),
+        os.path.join(APP_DIR, "bin", exe),
+    ]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return shutil.which("ffmpeg")
+
+
+def find_ffprobe(ffmpeg_path=None):
+    exe = "ffprobe.exe" if sys.platform.startswith("win") else "ffprobe"
+    cands = []
+    if ffmpeg_path:
+        d = os.path.dirname(ffmpeg_path)
+        cands += [os.path.join(d, exe), os.path.join(d, "bin", exe)]
+    cands += [
+        os.path.join(APP_DIR, exe),
+        os.path.join(APP_DIR, "ffmpeg", exe),
+        os.path.join(APP_DIR, "ffmpeg", "bin", exe),
+        os.path.join(APP_DIR, "bin", exe),
+    ]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return shutil.which("ffprobe")
+
+
+def safe_filename(name, maxlen=80):
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", name or "")
+    name = re.sub(r"\s+", " ", name).strip().strip(".")
+    if len(name) > maxlen:
+        name = name[:maxlen].rstrip()
+    return name or "record"
+
+
+def nearest_mp3_bitrate(kbps):
+    if not kbps or kbps <= 0:
+        return 192
+    return min(MP3_BITRATES, key=lambda b: abs(b - kbps))
+
+
+def _ffprobe_run(cmd, timeout):
+    kw = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
+          "stdin": subprocess.DEVNULL}
+    if sys.platform.startswith("win"):
+        kw["creationflags"] = 0x08000000
+    proc = None
+    try:
+        proc = subprocess.Popen(cmd, **kw)
+    except Exception:
+        return None
+    try:
+        stdout, _ = proc.communicate(timeout=timeout)
+        if proc.returncode != 0:
+            return None
+        return stdout
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.communicate(timeout=3)
+        except Exception:
+            pass
+        return None
+    except Exception:
+        try:
+            if proc is not None:
+                proc.kill()
+        except Exception:
+            pass
+        return None
+
+
+def probe_audio_bitrate(ffprobe, url, use_tcp=True, timeout=10):
+    if not ffprobe:
+        return None
+    cmd = [ffprobe, "-v", "quiet", "-print_format", "json",
+           "-show_streams", "-select_streams", "a:0",
+           "-analyzeduration", "3000000",
+           "-probesize", "3000000"]
+    if use_tcp and str(url).lower().startswith("rtsp://"):
+        cmd += ["-rtsp_transport", "tcp",
+                "-rtsp_flags", "prefer_tcp",
+                "-rw_timeout", "10000000"]
+    cmd += ["-i", url]
+    stdout = _ffprobe_run(cmd, timeout)
+    if not stdout:
+        return None
+    try:
+        data = json.loads(stdout.decode("utf-8", "replace"))
+    except Exception:
+        return None
+    for st in data.get("streams", []):
+        br = st.get("bit_rate")
+        if br:
+            try:
+                return int(br) // 1000
+            except Exception:
+                pass
+    return None
+
+def _probe_stream_codecs(ffprobe, url, use_tcp=True, timeout=10):
+    if not ffprobe:
+        return None, None
+    cmd = [ffprobe, "-v", "quiet", "-print_format", "json",
+           "-show_streams",
+           "-analyzeduration", "3000000",
+           "-probesize", "3000000"]
+    if use_tcp and str(url).lower().startswith("rtsp://"):
+        cmd += ["-rtsp_transport", "tcp",
+                "-rtsp_flags", "prefer_tcp",
+                "-rw_timeout", "10000000"]
+    cmd += ["-i", url]
+    stdout = _ffprobe_run(cmd, timeout)
+    if not stdout:
+        return None, None
+    try:
+        data = json.loads(stdout.decode("utf-8", "replace"))
+    except Exception:
+        return None, None
+    v_codec = None
+    a_codec = None
+    for st in data.get("streams", []):
+        ct = st.get("codec_type")
+        name = (st.get("codec_name") or "").lower()
+        if ct == "video" and v_codec is None:
+            v_codec = name
+        elif ct == "audio" and a_codec is None:
+            a_codec = name
+    return v_codec, a_codec
+
+
+def _sniff_is_hls(url, timeout=3):
+    if not url or not url.lower().startswith(("http://", "https://")):
+        return False
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (IPTVPlayer)",
+            "Range": "bytes=0-4095",
+        })
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            head = r.read(4096)
+    except Exception:
+        return False
+    return head[:7] == b"#EXTM3U"
+
+
+HLS_NORMAL_SEG_EXTS = {
+    ".ts", ".m4s", ".mp4", ".m4a", ".aac", ".mp3", ".cmfa", ".cmfv", ".m4v",
+}
+HLS_PLAYLIST_EXTS = {".m3u8", ".m3u"}
+
+_HLS_PROXY_UA = {"User-Agent": "Mozilla/5.0 (IPTVPlayer)"}
+
+
+def _hls_fetch_text(url, headers=None, timeout=10):
+    req = urllib.request.Request(url, headers=headers or _HLS_PROXY_UA)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace"), r.geturl()
+
+
+def _hls_ext(url):
+    if not url:
+        return ""
+    return os.path.splitext(urllib.parse.urlsplit(url).path)[1].lower()
+
+
+def _hls_url_looks_disguised(u):
+    ext = _hls_ext(u)
+    if not ext:
+        return False
+    if ext in HLS_NORMAL_SEG_EXTS:
+        return False
+    if ext in HLS_PLAYLIST_EXTS:
+        return False
+    return True
+
+
+def _hls_is_disguised(text):
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        m = re.search(r'URI="([^"]+)"', s)
+        if m:
+            if _hls_url_looks_disguised(m.group(1)):
+                return True
+            continue
+        if not s.startswith("#"):
+            if _hls_url_looks_disguised(s):
+                return True
+    return False
+
+
+class HLSRewriteProxy(object):
+
+    def __init__(self, origin_url, headers=None, timeout=30, fetch_retries=3):
+        self.origin_url = origin_url
+        self.headers = dict(_HLS_PROXY_UA)
+        if headers:
+            self.headers.update(headers)
+        self.timeout = timeout
+        try:
+            self.fetch_retries = max(1, int(fetch_retries))
+        except Exception:
+            self.fetch_retries = 3
+        self._token_map = {}
+        self._lock = threading.Lock()
+        self._httpd = None
+        self._thread = None
+        self.port = None
+
+    def _fetch(self, url):
+        last_exc = None
+        for attempt in range(self.fetch_retries):
+            try:
+                req = urllib.request.Request(url, headers=self.headers)
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    return r.read(), r.geturl()
+            except Exception as e:
+                last_exc = e
+                if attempt < self.fetch_retries - 1:
+                    try:
+                        time.sleep(0.4 * (attempt + 1))
+                    except Exception:
+                        pass
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("fetch failed: %s" % url)
+
+    def _register(self, real_url):
+        token = hashlib.md5(real_url.encode("utf-8")).hexdigest()
+        with self._lock:
+            self._token_map[token] = real_url
+        return token
+
+    def _resolve(self, token):
+        with self._lock:
+            return self._token_map.get(token)
+
+    def _rewrite_uri_attr(self, line, base_url, host, ext):
+        m = re.search(r'URI="([^"]+)"', line)
+        if not m:
+            return line
+        real = urllib.parse.urljoin(base_url, m.group(1))
+        token = self._register(real)
+        new_uri = "http://%s/seg/%s%s" % (host, token, ext)
+        return line[:m.start(1)] + new_uri + line[m.end(1):]
+
+    def _rewrite_playlist(self, text, base_url, host):
+        is_media = ("#EXTINF" in text) or ("#EXT-X-TARGETDURATION" in text)
+        is_master = (not is_media) and (
+            "#EXT-X-STREAM-INF" in text
+            or "#EXT-X-MEDIA" in text
+            or "#EXT-X-I-FRAME-STREAM-INF" in text
+        )
+
+        out = []
+        for raw in text.splitlines():
+            s = raw.strip()
+            if not s:
+                out.append(raw)
+                continue
+
+            if s.startswith("#EXT-X-MAP"):
+                s = self._rewrite_uri_attr(s, base_url, host, ".m4s")
+                out.append(s)
+                continue
+            if s.startswith("#EXT-X-MEDIA"):
+                s = self._rewrite_uri_attr(s, base_url, host, ".m3u8")
+                out.append(s)
+                continue
+            if s.startswith("#EXT-X-I-FRAME-STREAM-INF"):
+                s = self._rewrite_uri_attr(s, base_url, host, ".m3u8")
+                out.append(s)
+                continue
+            if s.startswith("#EXT-X-KEY") or s.startswith("#EXT-X-SESSION-KEY"):
+                s = self._rewrite_uri_attr(s, base_url, host, ".bin")
+                out.append(s)
+                continue
+            if s.startswith("#EXT-X-PART") or s.startswith("#EXT-X-PRELOAD-HINT"):
+                s = self._rewrite_uri_attr(s, base_url, host, ".m4s")
+                out.append(s)
+                continue
+
+            if s.startswith("#"):
+                out.append(s)
+                continue
+
+            real = urllib.parse.urljoin(base_url, s)
+            token = self._register(real)
+            ext = ".m3u8" if is_master else ".m4s"
+            out.append("http://%s/seg/%s%s" % (host, token, ext))
+
+        return "\n".join(out) + "\n"
+
+    def start(self):
+        proxy = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, fmt, *args):
+                pass
+
+            def do_GET(self):
+                try:
+                    path = self.path.split("?", 1)[0]
+                    if path.startswith("/playlist"):
+                        proxy._serve_playlist(self)
+                    elif path.startswith("/seg/"):
+                        proxy._serve_segment(self, path)
+                    else:
+                        self.send_error(404)
+                except (BrokenPipeError, ConnectionResetError,
+                        ConnectionAbortedError):
+                    pass
+                except Exception:
+                    try:
+                        self.send_error(503)
+                    except Exception:
+                        pass
+
+        class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+            def handle_error(self, request, client_address):
+                et, _ev, _tb = sys.exc_info()
+                if et is not None and issubclass(
+                        et,
+                        (BrokenPipeError,
+                         ConnectionResetError,
+                         ConnectionAbortedError)):
+                    return
+                try:
+                    super().handle_error(request, client_address)
+                except Exception:
+                    pass
+
+        self._httpd = Server(("127.0.0.1", 0), Handler)
+        self.port = self._httpd.server_address[1]
+        self._thread = threading.Thread(target=self._httpd.serve_forever,
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        try:
+            if self._httpd:
+                self._httpd.shutdown()
+                self._httpd.server_close()
+        except Exception:
+            pass
+        self._httpd = None
+
+    def playlist_url(self):
+        return "http://127.0.0.1:%d/playlist.m3u8" % self.port
+
+    def _serve_playlist(self, handler):
+        self._proxy_playlist(handler, self.origin_url)
+
+    def _proxy_playlist(self, handler, real_url):
+        try:
+            body, final_url = self._fetch(real_url)
+        except Exception as e:
+            try:
+                sys.stderr.write(
+                    "[HLS-proxy] playlist fetch failed: %s (%s)\n"
+                    % (real_url, e))
+                sys.stderr.flush()
+            except Exception:
+                pass
+            try:
+                handler.send_error(503, "upstream fetch failed")
+            except Exception:
+                pass
+            return
+
+        text = body.decode("utf-8", "replace")
+        host = handler.headers.get("Host") or ("127.0.0.1:%d" % self.port)
+        rewritten = self._rewrite_playlist(text, final_url, host)
+        data = rewritten.encode("utf-8")
+
+        try:
+            handler.send_response(200)
+            handler.send_header("Content-Type",
+                                "application/vnd.apple.mpegurl")
+            handler.send_header("Content-Length", str(len(data)))
+            handler.send_header("Cache-Control", "no-cache")
+            handler.end_headers()
+            handler.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+    def _serve_segment(self, handler, path):
+        m = re.match(r"^/seg/([0-9a-f]{32})(\.[a-zA-Z0-9]+)?$", path)
+        if not m:
+            handler.send_error(404)
+            return
+        real = self._resolve(m.group(1))
+        if not real:
+            handler.send_error(404)
+            return
+
+        try:
+            data, _ = self._fetch(real)
+        except Exception as e:
+            try:
+                sys.stderr.write(
+                    "[HLS-proxy] segment fetch failed: %s (%s)\n"
+                    % (real, e))
+                sys.stderr.flush()
+            except Exception:
+                pass
+            try:
+                handler.send_error(503, "upstream fetch failed")
+            except Exception:
+                pass
+            return
+
+        if data[:7] == b"#EXTM3U":
+            text = data.decode("utf-8", "replace")
+            host = handler.headers.get("Host") or ("127.0.0.1:%d" % self.port)
+            body = self._rewrite_playlist(text, real, host).encode("utf-8")
+            content_type = "application/vnd.apple.mpegurl"
+        else:
+            body = data
+            content_type = "video/mp4"
+
+        try:
+            handler.send_response(200)
+            handler.send_header("Content-Type", content_type)
+            handler.send_header("Content-Length", str(len(body)))
+            handler.send_header("Cache-Control", "no-cache")
+            handler.end_headers()
+            handler.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+
 DEFAULT_CONFIG = {
     "userid": "gf001",
     "authinfo": "xxx",
@@ -300,6 +758,7 @@ DEFAULT_CONFIG = {
     "epg_threads": 1,
     "epg_timeout": 10,
     "webdav_sources": [],
+    "record_stop_on_switch": True,
 }
 
 
@@ -981,6 +1440,8 @@ class IPTVApp(tk.Tk):
         self._seek_status_after_id = None
         self._video_click_after_id = None
         self._net_paused = False
+        self._muted = False
+        self._vol_before_mute = None
 
         self._progress_after_id = None
         self.replay_range_start = None
@@ -1000,6 +1461,20 @@ class IPTVApp(tk.Tk):
         self.webdav_path = ""
         self.webdav_items = []
         self._webdav_req_id = 0
+
+        self.recording = False
+        self.rec_proc = None
+        self.rec_mode = None
+        self.rec_path = ""
+        self.rec_start = None
+        self.rec_var = tk.StringVar(value="")
+        self._rec_poll_id = None
+        self._rec_stop_wait = 0
+        self._rec_stderr = []
+        self._rec_check_id = None
+        self._rec_probing = False
+        self._rec_probe_url = None
+        self.rec_proxy = None
 
         self._setup_ttk_style()
         self.build_menu()
@@ -1028,6 +1503,7 @@ class IPTVApp(tk.Tk):
         style.configure("TFrame", background=COLORS["bg_root"])
         style.configure("Panel.TFrame", background=COLORS["bg_panel"])
         style.configure("Toolbar.TFrame", background=COLORS["bg_panel"])
+        style.configure("Status.TFrame", background=COLORS["status_bg"])
 
         style.configure("TLabel", background=COLORS["bg_root"],
                         foreground=COLORS["fg_primary"])
@@ -1037,6 +1513,8 @@ class IPTVApp(tk.Tk):
                         foreground=COLORS["fg_secondary"])
         style.configure("Status.TLabel", background=COLORS["status_bg"],
                         foreground=COLORS["fg_secondary"], padding=(6, 3))
+        style.configure("Rec.TLabel", background=COLORS["status_bg"],
+                        foreground=COLORS["rec_red"], padding=(6, 3))
 
         style.configure("TEntry", fieldbackground=COLORS["bg_input"],
                         foreground=COLORS["fg_primary"],
@@ -1056,12 +1534,61 @@ class IPTVApp(tk.Tk):
         style.configure("TButton", background=COLORS["btn_bg"],
                         foreground=COLORS["fg_primary"],
                         bordercolor=COLORS["border"],
-                        focuscolor=COLORS["accent"],
+                        focuscolor=COLORS["bg_panel"],
                         padding=(8, 4))
         style.map("TButton",
                   background=[("active", COLORS["btn_active"]),
                               ("pressed", COLORS["accent_dim"])],
                   foreground=[("active", COLORS["fg_primary"])])
+        style.configure("RecActive.TButton",
+                        background=COLORS["btn_bg"],
+                        foreground=COLORS["rec_red"],
+                        bordercolor=COLORS["border"],
+                        focuscolor=COLORS["bg_panel"],
+                        padding=(8, 4),
+                        font=("Microsoft YaHei UI", 9, "bold"))
+        style.map("RecActive.TButton",
+                  background=[("active", COLORS["btn_active"]),
+                              ("pressed", COLORS["accent_dim"])],
+                  foreground=[("active", COLORS["rec_red"])])
+
+        style.configure("StopActive.TButton",
+                        background=COLORS["btn_bg"],
+                        foreground=COLORS["live_green"],
+                        bordercolor=COLORS["border"],
+                        focuscolor=COLORS["bg_panel"],
+                        padding=(8, 4),
+                        font=("Microsoft YaHei UI", 9, "bold"))
+        style.map("StopActive.TButton",
+                  background=[("active", COLORS["btn_active"]),
+                              ("pressed", COLORS["accent_dim"])],
+                  foreground=[("active", COLORS["live_green"])])
+
+        style.configure("Disabled.TButton",
+                        background=COLORS["btn_bg"],
+                        foreground="#888888",
+                        bordercolor=COLORS["border"],
+                        focuscolor=COLORS["bg_panel"],
+                        padding=(8, 4))
+        style.map("Disabled.TButton",
+                  background=[("active", COLORS["btn_bg"]),
+                              ("pressed", COLORS["btn_bg"]),
+                              ("disabled", COLORS["btn_bg"])],
+                  foreground=[("active", "#888888"),
+                              ("pressed", "#888888"),
+                              ("disabled", "#888888")])
+
+        style.configure("Muted.TButton",
+                        background=COLORS["btn_bg"],
+                        foreground=COLORS["rec_red"],
+                        bordercolor=COLORS["border"],
+                        focuscolor=COLORS["bg_panel"],
+                        padding=(8, 4),
+                        font=("Microsoft YaHei UI", 9, "bold"))
+        style.map("Muted.TButton",
+                  background=[("active", COLORS["btn_active"]),
+                              ("pressed", COLORS["accent_dim"])],
+                  foreground=[("active", COLORS["rec_red"])])
 
         style.configure("Arrow.TButton", background=COLORS["bg_panel"],
                         foreground=COLORS["fg_secondary"],
@@ -1112,11 +1639,13 @@ class IPTVApp(tk.Tk):
             keys = [k.strip() for k in keys.split(",") if k.strip()]
         self.cfg["http_replay_keys"] = keys
         try:
-            self.cfg["left_width"] = int(self.cfg.get("left_width", 250))
+            self.cfg["left_width"] = int(self.cfg.get("left_width", 200))
         except Exception:
-            self.cfg["left_width"] = 250
+            self.cfg["left_width"] = 200
         if not isinstance(self.cfg.get("webdav_sources"), list):
             self.cfg["webdav_sources"] = []
+        if "record_stop_on_switch" not in self.cfg:
+            self.cfg["record_stop_on_switch"] = True
 
     def save_config(self):
         try:
@@ -1126,18 +1655,26 @@ class IPTVApp(tk.Tk):
             messagebox.showerror("错误", "保存配置失败：%s" % e)
 
     def build_menu(self):
-        menubar = tk.Menu(self, bg=COLORS["bg_panel"], fg=COLORS["fg_primary"],
-                          disabledforeground=COLORS["disabled_fg"],
-                          activebackground=COLORS["accent_dim"],
-                          activeforeground=COLORS["fg_primary"],
-                          bd=0, relief="flat")
-        m = tk.Menu(menubar, tearoff=0, bg=COLORS["bg_panel"],
-                    fg=COLORS["fg_primary"],
-                    disabledforeground=COLORS["disabled_fg"],
-                    activebackground=COLORS["accent_dim"],
-                    activeforeground="#ffffff")
+        menubar = tk.Menu(
+            self,
+            bg=COLORS["bg_panel"],
+            fg=COLORS["fg_primary"],
+            disabledforeground=COLORS["disabled_fg"],
+            activebackground=COLORS["accent_dim"],
+            activeforeground=MENU_CHECK_ACTIVE_FG,
+            selectcolor=MENU_CHECK_FG,
+            bd=0, relief="flat")
+
+        m = tk.Menu(
+            menubar, tearoff=0,
+            bg=COLORS["bg_panel"],
+            fg=COLORS["fg_primary"],
+            disabledforeground=COLORS["disabled_fg"],
+            activebackground=COLORS["accent_dim"],
+            activeforeground=MENU_CHECK_ACTIVE_FG,
+            selectcolor=MENU_CHECK_FG)
         m.add_command(label="打开 m3u 文件...", command=self.open_m3u)
-        m.add_command(label="打开媒体文件...", command=self.open_media_file)
+        m.add_command(label="打开本地文件...", command=self.open_media_file)
         m.add_command(label="浏览 WebDAV...", command=self.open_webdav_dialog)
         m.add_command(label="重新加载", command=self.load_default)
         m.add_separator()
@@ -1147,11 +1684,14 @@ class IPTVApp(tk.Tk):
         m.add_command(label="退出", command=self.on_close)
         menubar.add_cascade(label="文件", menu=m)
 
-        pm = tk.Menu(menubar, tearoff=0, bg=COLORS["bg_panel"],
-                     fg=COLORS["fg_primary"],
-                     disabledforeground=COLORS["disabled_fg"],
-                     activebackground=COLORS["accent_dim"],
-                     activeforeground="#ffffff")
+        pm = tk.Menu(
+            menubar, tearoff=0,
+            bg=COLORS["bg_panel"],
+            fg=COLORS["fg_primary"],
+            disabledforeground=COLORS["disabled_fg"],
+            activebackground=COLORS["accent_dim"],
+            activeforeground=MENU_CHECK_ACTIVE_FG,
+            selectcolor=MENU_CHECK_FG)
         self.hw_var = tk.BooleanVar(value=bool(self.cfg.get("hw_decode", True)))
         self.tcp_var = tk.BooleanVar(value=bool(self.cfg.get("rtsp_tcp", True)))
         pm.add_checkbutton(label="硬件解码", variable=self.hw_var,
@@ -1160,19 +1700,47 @@ class IPTVApp(tk.Tk):
                            command=self.on_decode_option_changed)
         menubar.add_cascade(label="播放选项", menu=pm)
 
-        em = tk.Menu(menubar, tearoff=0, bg=COLORS["bg_panel"],
-                     fg=COLORS["fg_primary"],
-                     disabledforeground=COLORS["disabled_fg"],
-                     activebackground=COLORS["accent_dim"],
-                     activeforeground="#ffffff")
+        em = tk.Menu(
+            menubar, tearoff=0,
+            bg=COLORS["bg_panel"],
+            fg=COLORS["fg_primary"],
+            disabledforeground=COLORS["disabled_fg"],
+            activebackground=COLORS["accent_dim"],
+            activeforeground=MENU_CHECK_ACTIVE_FG,
+            selectcolor=MENU_CHECK_FG)
         em.add_command(label="下载 EPG", command=self.manual_epg_update)
         em.add_command(label="自定义 EPG 下载参数...", command=self.open_epg_settings)
         menubar.add_cascade(label="EPG选项", menu=em)
+
+        rm = tk.Menu(
+            menubar, tearoff=0,
+            bg=COLORS["bg_panel"],
+            fg=COLORS["fg_primary"],
+            disabledforeground=COLORS["disabled_fg"],
+            activebackground=COLORS["accent_dim"],
+            activeforeground=MENU_CHECK_ACTIVE_FG,
+            selectcolor=MENU_CHECK_FG)
+        rm.add_command(label="开始录制",
+                       command=self.start_record_auto)
+        rm.add_command(label="停止录制", command=self.stop_record)
+        rm.add_separator()
+        self.rec_switch_stop_var = tk.BooleanVar(
+            value=bool(self.cfg.get("record_stop_on_switch", True)))
+        rm.add_checkbutton(label="切换频道时停止录制",
+                           variable=self.rec_switch_stop_var,
+                           command=self.on_rec_switch_option_changed)
+        rm.add_separator()
+        rm.add_command(label="打开录制目录", command=self.open_record_dir)
+        menubar.add_cascade(label="录制", menu=rm)
 
         menubar.add_command(label="关于", command=self.show_about)
 
         self.menubar = menubar
         self.config(menu=menubar)
+
+    def on_rec_switch_option_changed(self):
+        self.cfg["record_stop_on_switch"] = bool(self.rec_switch_stop_var.get())
+        self.save_config()
 
     def show_about(self):
         win = tk.Toplevel(self)
@@ -1224,7 +1792,8 @@ class IPTVApp(tk.Tk):
         self.left_visible = True
         self.right_visible = bool(self.cfg.get("right_visible", False))
 
-        left_w = max(150, min(600, int(self.cfg.get("left_width", 250))))
+        _raw_left = int(self.cfg.get("left_width", 200))
+        left_w = max(150, min(600, int(_raw_left * 1)))
         left = ttk.Frame(self, width=left_w, style="Panel.TFrame")
         left.grid(row=0, column=0, sticky="ns")
         left.grid_propagate(False)
@@ -1317,20 +1886,39 @@ class IPTVApp(tk.Tk):
         ctl = ttk.Frame(mid, style="Toolbar.TFrame")
         ctl.grid(row=2, column=0, sticky="ew", padx=4, pady=3)
         self.ctl_bar = ctl
-        ttk.Button(ctl, text="▶ 直播", command=self.play_live).pack(side=tk.LEFT, padx=2)
-        ttk.Button(ctl, text="⏯ 暂停", command=self.toggle_pause).pack(side=tk.LEFT, padx=2)
-        ttk.Button(ctl, text="⏹ 停止", command=self.stop).pack(side=tk.LEFT, padx=2)
-        ttk.Button(ctl, text="⛶ 全屏", command=self.toggle_fullscreen).pack(side=tk.LEFT, padx=2)
-        ttk.Separator(ctl, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        ttk.Label(ctl, text="音量", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 4))
-        self.vol_var = tk.IntVar(value=int(self.cfg.get("volume", 80)))
+        ttk.Button(ctl, text="▶ 直播", width=7,
+                   command=self.play_live).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctl, text="⏯ 暂停", width=7,
+                   command=self.toggle_pause).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctl, text="⏹ 停止", width=7,
+                   command=self.stop).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctl, text="⛶ 全屏", width=7,
+                   command=self.toggle_fullscreen).pack(side=tk.LEFT, padx=2)
+
+        self.btn_rec = ttk.Button(ctl, text="● 录制", width=7,
+                                  command=self.start_record_auto)
+        self.btn_rec.pack(side=tk.LEFT, padx=2)
+        self.btn_rec_stop = ttk.Button(ctl, text="■ 停止录制", width=9,
+                                       command=self.stop_record)
+        self.btn_rec_stop.pack(side=tk.LEFT, padx=2)
+
+        self.btn_mute = ttk.Button(ctl, text="🔊", width=2,
+                                   command=self.toggle_mute)
+        self.btn_mute.pack(side=tk.LEFT, padx=2)
+        self.vol_var = tk.IntVar(value=int(self.cfg.get("volume", 75)))
         ttk.Scale(ctl, from_=0, to=100, variable=self.vol_var, length=100,
                   command=self.on_volume).pack(side=tk.LEFT, padx=2)
 
         self.status_var = tk.StringVar(value="就绪")
-        self.status_label = ttk.Label(mid, textvariable=self.status_var,
+        self.status_bar = ttk.Frame(mid, style="Status.TFrame")
+        self.status_bar.grid(row=3, column=0, sticky="ew", padx=4, pady=(3, 4))
+        self.status_bar.grid_columnconfigure(0, weight=1)
+        self.status_label = ttk.Label(self.status_bar, textvariable=self.status_var,
                                       style="Status.TLabel", anchor="w")
-        self.status_label.grid(row=3, column=0, sticky="ew", padx=4, pady=(3, 4))
+        self.status_label.grid(row=0, column=0, sticky="ew")
+        self.rec_label = ttk.Label(self.status_bar, textvariable=self.rec_var,
+                                   style="Rec.TLabel", anchor="e")
+        self.rec_label.grid(row=0, column=1, sticky="e")
 
         right = ttk.Frame(self, style="Panel.TFrame")
         right.grid(row=0, column=2, sticky="ns")
@@ -1364,7 +1952,7 @@ class IPTVApp(tk.Tk):
         df.pack(fill=tk.X, padx=8, pady=4)
         ttk.Label(df, text="回看", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 4))
         self.date_var = tk.StringVar()
-        self.date_cb = ttk.Combobox(df, textvariable=self.date_var, width=18,
+        self.date_cb = ttk.Combobox(df, textvariable=self.date_var, width=16,
                                     values=self.date_choices(), state="readonly")
         self.date_cb.pack(side=tk.LEFT, padx=2)
         self.date_cb.current(0)
@@ -1376,18 +1964,23 @@ class IPTVApp(tk.Tk):
         sf2 = ttk.Frame(self.right_body, style="Panel.TFrame")
         sf2.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
         sb2 = ttk.Scrollbar(sf2, orient=tk.VERTICAL)
+        sb2_h = ttk.Scrollbar(sf2, orient=tk.HORIZONTAL)
 
-        self.slot_list = tk.Listbox(sf2, exportselection=False, yscrollcommand=sb2.set,
+        self.slot_list = tk.Listbox(sf2, exportselection=False,
+                                    yscrollcommand=sb2.set,
+                                    xscrollcommand=sb2_h.set,
                                     font=("Microsoft YaHei UI", 10),
                                     bg=COLORS["bg_input"],
                                     fg=COLORS["fg_primary"],
                                     selectbackground=COLORS["select_bg"],
                                     selectforeground=COLORS["select_fg"],
                                     highlightthickness=0, bd=0,
-                                    relief="flat", width=32)
+                                    relief="flat", width=24)
 
         sb2.config(command=self.slot_list.yview)
+        sb2_h.config(command=self.slot_list.xview)
         sb2.pack(side=tk.RIGHT, fill=tk.Y)
+        sb2_h.pack(side=tk.BOTTOM, fill=tk.X)
         self.slot_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.slot_list.bind("<Double-Button-1>", lambda e: self.play_replay())
         self.slot_list.bind("<Button-1>", self._on_slot_click)
@@ -1406,6 +1999,9 @@ class IPTVApp(tk.Tk):
             fill=tk.X, padx=8, pady=(4, 3))
         ttk.Button(self.right_body, text="复制回看地址",
                    command=self.copy_replay_url).pack(
+            fill=tk.X, padx=8, pady=(3, 3))
+        ttk.Button(self.right_body, text="打开录制目录",
+                   command=self.open_record_dir).pack(
             fill=tk.X, padx=8, pady=(3, 8))
 
         self._apply_left_visible()
@@ -1424,6 +2020,518 @@ class IPTVApp(tk.Tk):
         self.bind("<Down>", self._on_arrow_down)
 
         self.refresh_slots()
+
+    def _record_display_name(self):
+        raw = ""
+        if isinstance(self.current, dict):
+            raw = (self.current.get("raw_name")
+                   or self.current.get("name") or "")
+        if not raw:
+            raw = self.current_title or ""
+        raw = re.sub(r'^\s*(?:\[[^\]]*\]|📁|🎵|🎬|📄|🌐|⬅|▶|⏹|●)\s*', "", raw)
+        return safe_filename(raw) or "record"
+
+    def _guess_media_kind(self, url):
+        if not url:
+            return None
+        p = url
+        if p.lower().startswith("file://"):
+            try:
+                p = urllib.request.url2pathname(p[7:])
+            except Exception:
+                pass
+        p = p.split("?", 1)[0].split("#", 1)[0]
+        ext = os.path.splitext(p)[1].lower()
+        if ext in AUDIO_EXTS:
+            return "audio"
+        if ext in MEDIA_EXTS:
+            return "video"
+        return None
+
+    def _build_record_cmd(self, mode, url, out_path):
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            return None, None
+
+        tcp = bool(self.cfg.get("rtsp_tcp", True))
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "info", "-y"]
+
+        low = url.lower()
+
+        if low.startswith("rtsp://"):
+            if tcp:
+                cmd += ["-rtsp_transport", "tcp",
+                        "-rtsp_flags", "prefer_tcp"]
+            else:
+                cmd += ["-rtsp_transport", "udp"]
+            cmd += ["-rw_timeout", "15000000"]
+
+        elif low.startswith(("http://", "https://")):
+            is_local_proxy = ("127.0.0.1" in low or "localhost" in low)
+            is_hls = is_local_proxy or (".m3u8" in low)
+            is_rtsp_gateway = (not is_hls) and (
+                "/rtsp/" in low or "/rtsp?" in low
+                or "rtsp=" in low or "playseek=" in low
+            )
+
+            cmd += ["-protocol_whitelist",
+                    "file,http,https,tcp,tls,crypto,httpproxy"]
+
+            if is_hls:
+                cmd += ["-f", "hls", "-allowed_extensions", "ALL"]
+                cmd += ["-rw_timeout", "20000000"]
+            elif is_rtsp_gateway:
+                cmd += ["-user_agent", "Mozilla/5.0 (IPTVPlayer)",
+                        "-headers",
+                        "Accept: */*\r\nConnection: keep-alive\r\n"]
+                cmd += ["-rw_timeout", "30000000"]
+            else:
+                cmd += ["-rw_timeout", "20000000"]
+
+        cmd += ["-i", url]
+
+        if mode == "video":
+            ffprobe = find_ffprobe(ffmpeg)
+            v_codec, a_codec = _probe_stream_codecs(ffprobe, url, tcp, timeout=10)
+
+            if v_codec in ("h264", "hevc", "h265", "mpeg4"):
+                video_args = ["-c:v", "copy"]
+            else:
+                video_args = ["-c:v", "libx264",
+                              "-preset", "veryfast",
+                              "-crf", "23",
+                              "-pix_fmt", "yuv420p"]
+
+            if a_codec == "aac":
+                audio_args = ["-c:a", "copy", "-bsf:a", "aac_adtstoasc"]
+            elif a_codec in ("mp3", "ac3", "eac3", "alac", "flac"):
+                audio_args = ["-c:a", "copy"]
+            else:
+                audio_args = ["-c:a", "aac", "-b:a", "128k", "-ac", "2"]
+
+            cmd += ["-map", "0:v:0?", "-map", "0:a:0?"]
+            cmd += video_args
+            cmd += audio_args
+            cmd += [
+                "-flush_packets", "1",
+                "-f", "mp4",
+                "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                out_path,
+            ]
+        else:
+            ffprobe = find_ffprobe(ffmpeg)
+            kb = nearest_mp3_bitrate(
+                probe_audio_bitrate(ffprobe, url, tcp, timeout=10))
+            cmd += [
+                "-map", "0:a:0?",
+                "-vn",
+                "-c:a", "libmp3lame",
+                "-b:a", "%dk" % kb,
+                "-f", "mp3",
+                out_path,
+            ]
+        return cmd, ffmpeg
+
+    def _start_rec_stderr_reader(self, proc):
+        def reader():
+            try:
+                for line in iter(proc.stderr.readline, b""):
+                    try:
+                        s = line.decode("utf-8", "replace").rstrip()
+                    except Exception:
+                        s = ""
+                    if s:
+                        self._rec_stderr.append(s)
+                        if len(self._rec_stderr) > 300:
+                            del self._rec_stderr[:150]
+            except Exception:
+                pass
+        threading.Thread(target=reader, daemon=True).start()
+
+    def _prepare_record_source(self, url):
+        if not url or not url.lower().startswith(("http://", "https://")):
+            return url, None
+        try:
+            is_hls = _sniff_is_hls(url, timeout=3)
+        except Exception:
+            is_hls = False
+        if not is_hls:
+            return url, None
+        try:
+            proxy = HLSRewriteProxy(url)
+            proxy.start()
+            return proxy.playlist_url(), proxy
+        except Exception:
+            return url, None
+
+    def _stop_recording_for_switch(self):
+        if not self.recording:
+            return False
+        if not self.cfg.get("record_stop_on_switch", True):
+            return False
+        try:
+            self._stop_record_blocking()
+        except Exception:
+            pass
+        try:
+            self._finish_recording(silent=True)
+        except Exception:
+            pass
+        self.status_var.set("切换频道，已停止录制")
+        return True
+
+    def start_record_auto(self):
+        if self.recording:
+            messagebox.showinfo("提示", "正在录制中，请先停止当前录制。")
+            return
+        if is_local_media_file(self.current_url):
+            messagebox.showinfo("提示", "本地媒体文件不支持录制。")
+            return
+        if self._rec_probing:
+            self.status_var.set("正在准备录制，请稍候…")
+            return
+        if not self.current_url:
+            messagebox.showinfo("提示", "请先播放频道或节目，再开始录制。")
+            return
+
+        try:
+            os.makedirs(RECORD_DIR, exist_ok=True)
+            t = os.path.join(RECORD_DIR, ".w")
+            open(t, "w").close()
+            os.remove(t)
+        except Exception as e:
+            messagebox.showerror("错误", "录制目录不可写：%s\n%s" % (RECORD_DIR, e))
+            return
+
+        kind = self._guess_media_kind(self.current_url)
+        if kind in ("video", "audio"):
+            self.start_record(kind)
+            return
+
+        self.start_record("video")
+
+    def start_record(self, mode):
+        if self.recording:
+            messagebox.showinfo("提示", "正在录制中，请先停止当前录制。")
+            return
+        if self._rec_probing:
+            self.status_var.set("正在准备录制，请稍候…")
+            return
+        if not self.current_url:
+            messagebox.showinfo("提示", "请先播放频道或节目，再开始录制。")
+            return
+
+        url = self.current_url
+        try:
+            os.makedirs(RECORD_DIR, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("错误", "无法创建录制目录：%s" % e)
+            return
+
+        self._rec_probing = True
+        self.status_var.set("正在准备录制…")
+        try:
+            self.btn_rec.state(["disabled"])
+        except Exception:
+            pass
+
+        def worker():
+            try:
+                rec_url, proxy = self._prepare_record_source(url)
+            except Exception:
+                rec_url, proxy = url, None
+            try:
+                self.after(0, lambda: self._do_start_record(mode, url, rec_url, proxy))
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _do_start_record(self, mode, orig_url, rec_url, proxy):
+        self._rec_probing = False
+        try:
+            self.btn_rec.state(["!disabled"])
+        except Exception:
+            pass
+        if self.recording:
+            messagebox.showinfo("提示", "正在录制中，请先停止当前录制。")
+            if proxy:
+                proxy.stop()
+            return
+        if self.current_url != orig_url:
+            self.status_var.set("流地址已改变，已取消录制")
+            if proxy:
+                proxy.stop()
+            return
+
+        try:
+            os.makedirs(RECORD_DIR, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("错误", "无法创建录制目录：%s" % e)
+            if proxy:
+                proxy.stop()
+            return
+
+        name = self._record_display_name()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ext = "mp4" if mode == "video" else "mp3"
+        out_path = os.path.join(RECORD_DIR, "%s_%s.%s" % (name, ts, ext))
+        n = 1
+        while os.path.exists(out_path):
+            out_path = os.path.join(RECORD_DIR,
+                                    "%s_%s_%d.%s" % (name, ts, n, ext))
+            n += 1
+
+        cmd, ffmpeg = self._build_record_cmd(mode, rec_url, out_path)
+        if cmd is None:
+            messagebox.showerror(
+                "缺少 ffmpeg",
+                "未找到 ffmpeg，无法录制。\n\n"
+                "请安装 ffmpeg 并加入 PATH，或把 ffmpeg.exe 放到程序目录下，"
+                "例如：\n%s" % os.path.join(APP_DIR, "ffmpeg.exe"))
+            if proxy:
+                proxy.stop()
+            return
+
+        kw = dict(stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                  stderr=subprocess.PIPE)
+        if sys.platform.startswith("win"):
+            kw["creationflags"] = 0x08000000
+        try:
+            proc = subprocess.Popen(cmd, **kw)
+        except Exception as e:
+            messagebox.showerror("录制失败", "无法启动 ffmpeg：%s" % e)
+            if proxy:
+                proxy.stop()
+            return
+
+        self._rec_stderr = []
+        self._start_rec_stderr_reader(proc)
+
+        self.rec_proc = proc
+        self.rec_mode = mode
+        self.rec_path = out_path
+        self.rec_start = datetime.now()
+        self.recording = True
+        self.rec_proxy = proxy
+        self._rec_stop_wait = 0
+
+        try:
+            self.btn_rec.configure(style="RecActive.TButton")
+            self.btn_rec_stop.configure(style="StopActive.TButton")
+        except Exception:
+            pass
+        label = "录像" if mode == "video" else "录音"
+        self.status_var.set("正在%s：%s" % (label, os.path.basename(out_path)))
+        self._update_rec_status()
+        self._rec_check_id = self.after(2000, self._check_record_started)
+
+    def _check_record_started(self):
+        self._rec_check_id = None
+        if not self.recording:
+            return
+        proc = self.rec_proc
+        if proc is None or proc.poll() is None:
+            return
+        rc = proc.returncode
+        err = "\n".join(self._rec_stderr[-30:]).strip()
+        mode = self.rec_mode
+        self._finish_recording(silent=True)
+        label = "录像" if mode == "video" else "录音"
+        self.status_var.set("%s启动失败" % label)
+        messagebox.showerror(
+            "录制失败",
+            "ffmpeg 启动后立即退出（代码 %s）。\n\n"
+            "最近输出：\n%s" % (rc, err[-1200:] or "（无输出）"))
+
+    def _update_rec_status(self):
+        self._rec_poll_id = None
+        if not self.recording:
+            self.rec_var.set("")
+            return
+        proc = self.rec_proc
+        if proc is not None and proc.poll() is not None:
+            rc = proc.returncode
+            err = "\n".join(self._rec_stderr[-30:]).strip()
+            mode = self.rec_mode
+            path = self.rec_path
+            self._finish_recording(silent=True)
+            label = "录像" if mode == "video" else "录音"
+            existed = path and os.path.isfile(path) and os.path.getsize(path) > 0
+            if existed:
+                size_mb = os.path.getsize(path) / 1048576.0
+                self.status_var.set("%s异常终止，文件已保留：%s（%.2f MB）" % (
+                    label, path, size_mb))
+                messagebox.showwarning(
+                    "录制中断",
+                    "ffmpeg 意外退出（代码 %s）。\n已生成文件：\n%s（%.2f MB）\n\n"
+                    "最近输出：\n%s" % (rc, path, size_mb, err[-1200:] or "（无输出）"))
+            else:
+                self.status_var.set("%s意外中断，未生成文件" % label)
+                messagebox.showerror(
+                    "录制中断",
+                    "ffmpeg 意外退出（代码 %s），未生成有效文件。\n\n"
+                    "最近输出：\n%s" % (rc, err[-1200:] or "（无输出）"))
+            return
+        try:
+            elapsed = int((datetime.now() - self.rec_start).total_seconds())
+        except Exception:
+            elapsed = 0
+        h, r = divmod(elapsed, 3600)
+        m, s = divmod(r, 60)
+        tag = "录像" if self.rec_mode == "video" else "录音"
+        self.rec_var.set("● %s %02d:%02d:%02d  %s" % (
+            tag, h, m, s, os.path.basename(self.rec_path)))
+        self._rec_poll_id = self.after(1000, self._update_rec_status)
+
+    def stop_record(self):
+        if not self.recording or self.rec_proc is None:
+            self.status_var.set("当前没有正在进行的录制")
+            return
+        if self._rec_poll_id is not None:
+            try:
+                self.after_cancel(self._rec_poll_id)
+            except Exception:
+                pass
+            self._rec_poll_id = None
+        self.status_var.set("正在保存录制文件，请稍候…")
+        try:
+            self.rec_proc.stdin.write(b"q")
+            self.rec_proc.stdin.flush()
+        except Exception:
+            pass
+        self._rec_stop_wait = 0
+        self._poll_rec_stop()
+
+    def _poll_rec_stop(self):
+        if not self.recording:
+            return
+        proc = self.rec_proc
+        if proc is None:
+            self._finish_recording()
+            return
+        if proc.poll() is None:
+            self._rec_stop_wait += 1
+            if self._rec_stop_wait == 25:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            elif self._rec_stop_wait >= 45:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            self.after(200, self._poll_rec_stop)
+            return
+        self._finish_recording()
+
+    def _stop_record_blocking(self):
+        proc = self.rec_proc
+        if proc is None:
+            return
+        if self._rec_poll_id is not None:
+            try:
+                self.after_cancel(self._rec_poll_id)
+            except Exception:
+                pass
+            self._rec_poll_id = None
+        try:
+            proc.stdin.write(b"q")
+            proc.stdin.flush()
+        except Exception:
+            pass
+
+    def _finish_recording(self, silent=False):
+        if not self.recording and self.rec_proc is None:
+            return
+        proc = self.rec_proc
+        path = self.rec_path
+        mode = self.rec_mode
+        proxy = self.rec_proxy
+
+        self.rec_proc = None
+        self.recording = False
+        self.rec_mode = None
+        self.rec_path = ""
+        self.rec_start = None
+        self.rec_proxy = None
+        self._rec_stop_wait = 0
+        try:
+            self.btn_rec.configure(style="TButton")
+            self.btn_rec_stop.configure(style="TButton")
+        except Exception:
+            pass
+
+        if proxy:
+            proxy.stop()
+
+        if self._rec_poll_id is not None:
+            try:
+                self.after_cancel(self._rec_poll_id)
+            except Exception:
+                pass
+            self._rec_poll_id = None
+        if self._rec_check_id is not None:
+            try:
+                self.after_cancel(self._rec_check_id)
+            except Exception:
+                pass
+            self._rec_check_id = None
+
+        self.rec_var.set("")
+
+        if proc is not None:
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                if proc.stderr:
+                    proc.stderr.close()
+            except Exception:
+                pass
+
+        if silent:
+            return
+
+        label = "录像" if mode == "video" else "录音"
+        if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+            size_mb = os.path.getsize(path) / 1048576.0
+            self.status_var.set("%s完成：%s（%.2f MB）" % (label, path, size_mb))
+        else:
+            err = "\n".join(self._rec_stderr[-20:]).strip()
+            if err:
+                self.status_var.set("%s结束，未生成有效文件" % label)
+                messagebox.showwarning(
+                    "%s未生成文件" % label,
+                    "未在录制目录生成有效文件：\n%s\n\n"
+                    "ffmpeg 最近输出：\n%s" % (RECORD_DIR, err[-1200:]))
+            else:
+                self.status_var.set("%s结束，但未生成有效文件" % label)
+                messagebox.showwarning(
+                    "%s未生成文件" % label,
+                    "未在录制目录生成有效文件：\n%s\n\n"
+                    "建议检查：\n"
+                    "• 流是否可被 ffmpeg 直接访问（有些源限制并发）\n"
+                    "• 是否使用了需要鉴权的回看地址\n" % RECORD_DIR)
+
+    def open_record_dir(self):
+        try:
+            os.makedirs(RECORD_DIR, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("错误", "无法创建录制目录：%s" % e)
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(RECORD_DIR)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", RECORD_DIR])
+            else:
+                subprocess.Popen(["xdg-open", RECORD_DIR])
+        except Exception as e:
+            messagebox.showerror("错误", "无法打开录制目录：%s\n%s" % (RECORD_DIR, e))
 
     def _on_channel_click(self, event=None):
         try:
@@ -1711,11 +2819,13 @@ class IPTVApp(tk.Tk):
         if self.webdav_mode:
             return
         ch = self.selected_channel() or self.current
-        m = tk.Menu(self, tearoff=0,
-                    bg=COLORS["bg_panel"], fg=COLORS["fg_primary"],
-                    disabledforeground=COLORS["disabled_fg"],
-                    activebackground=COLORS["accent_dim"],
-                    activeforeground="#ffffff")
+        m = tk.Menu(
+            self, tearoff=0,
+            bg=COLORS["bg_panel"], fg=COLORS["fg_primary"],
+            disabledforeground=COLORS["disabled_fg"],
+            activebackground=COLORS["accent_dim"],
+            activeforeground=MENU_CHECK_ACTIVE_FG,
+            selectcolor=MENU_CHECK_FG)
 
         if not ch:
             m.add_command(label="（请先在左侧选择频道）", state="disabled")
@@ -1733,25 +2843,33 @@ class IPTVApp(tk.Tk):
             m.add_command(label="▶ 直播  %s" % ch["name"],
                           command=self.play_live)
         m.add_separator()
+        m.add_command(label="开始录制",
+                      command=self.start_record_auto)
+        m.add_command(label="停止录制", command=self.stop_record)
+        m.add_separator()
 
         if is_local:
             m.add_command(label="本地媒体文件，无回看", state="disabled")
         elif not replay_supported(ch["url"], self.cfg):
             m.add_command(label="该频道不支持回看", state="disabled")
         else:
-            replay_menu = tk.Menu(m, tearoff=0,
-                                  bg=COLORS["bg_panel"], fg=COLORS["fg_primary"],
-                                  disabledforeground=COLORS["disabled_fg"],
-                                  activebackground=COLORS["accent_dim"],
-                                  activeforeground="#ffffff")
+            replay_menu = tk.Menu(
+                m, tearoff=0,
+                bg=COLORS["bg_panel"], fg=COLORS["fg_primary"],
+                disabledforeground=COLORS["disabled_fg"],
+                activebackground=COLORS["accent_dim"],
+                activeforeground=MENU_CHECK_ACTIVE_FG,
+                selectcolor=MENU_CHECK_FG)
             now = self.local_now()
             earliest = self.earliest_date()
             for d, display in self._date_list():
-                day_menu = tk.Menu(replay_menu, tearoff=0,
-                                   bg=COLORS["bg_panel"], fg=COLORS["fg_primary"],
-                                   disabledforeground=COLORS["disabled_fg"],
-                                   activebackground=COLORS["accent_dim"],
-                                   activeforeground="#ffffff")
+                day_menu = tk.Menu(
+                    replay_menu, tearoff=0,
+                    bg=COLORS["bg_panel"], fg=COLORS["fg_primary"],
+                    disabledforeground=COLORS["disabled_fg"],
+                    activebackground=COLORS["accent_dim"],
+                    activeforeground=MENU_CHECK_ACTIVE_FG,
+                    selectcolor=MENU_CHECK_FG)
                 slots, _ = self.build_day_slots(ch, d)
                 for label, start, end in slots:
                     if start >= now or d < earliest:
@@ -1836,7 +2954,6 @@ class IPTVApp(tk.Tk):
             self._seek_status_after_id = None
 
     def _flash_seek_status(self, text):
-        """临时显示 seek 提示，5 秒后恢复为“正在播放”信息。"""
         self._cancel_seek_status_timer()
         self.status_var.set(text)
         self._seek_status_after_id = self.after(5000, self._restore_play_status)
@@ -1844,6 +2961,8 @@ class IPTVApp(tk.Tk):
     def _restore_play_status(self):
         self._seek_status_after_id = None
         if getattr(self, "_closing", False):
+            return
+        if self.recording:
             return
         if not self.current_url:
             return
@@ -2261,7 +3380,7 @@ class IPTVApp(tk.Tk):
             st["ok"], st["nodata"], st["fail"], st["removed"])
 
         if st["silent"]:
-            if not st["error"] and changed and not self.current_url:
+            if not st["error"] and changed and not self.current_url and not self.recording:
                 self.status_var.set(summary)
         elif st["error"]:
             self.status_var.set("EPG 更新失败：" + st["error"])
@@ -2519,7 +3638,7 @@ class IPTVApp(tk.Tk):
         sources = list(self.cfg.get("webdav_sources") or [])
         self._webdav_combo_sources = sources
 
-        names = ["📄 IPTV（本地列表）"]
+        names = ["📄 IPTV(本地)"]
         for s in sources:
             names.append("🌐 " + (s.get("name") or s.get("url") or "?"))
 
@@ -2664,6 +3783,15 @@ class IPTVApp(tk.Tk):
                              "无法读取目录：%s\n\n%s" % (path or "/", err))
 
     def _play_webdav_file(self, item):
+        self._stop_recording_for_switch()
+        try:
+            if not self.recording:
+                self.btn_rec.configure(style="TButton")
+                self.btn_rec_stop.configure(style="TButton")
+                self.btn_rec.state(["!disabled"])
+                self.btn_rec_stop.state(["!disabled"])
+        except Exception:
+            pass
         src = self.webdav_source or {}
         user = (src.get("user") or "").strip()
         pwd = src.get("password") or ""
@@ -2704,6 +3832,11 @@ class IPTVApp(tk.Tk):
             self.player.play()
             self.player.audio_set_volume(self.vol_var.get())
             self.status_var.set("正在播放：%s" % item["name"])
+            if self._muted:
+                try:
+                    self.player.audio_set_mute(True)
+                except Exception:
+                    pass
         except Exception as e:
             self.status_var.set("播放失败：%s" % e)
 
@@ -2718,6 +3851,14 @@ class IPTVApp(tk.Tk):
         paths = filedialog.askopenfilenames(title="选择媒体文件", filetypes=types)
         if not paths:
             return
+
+        if self.webdav_mode:
+            self._exit_webdav()
+
+        has_non_local = any(not c.get("local") for c in self.channels)
+        is_append = not has_non_local
+        if has_non_local:
+            self.channels = []
 
         added = []
         for p in paths:
@@ -2734,10 +3875,25 @@ class IPTVApp(tk.Tk):
             self.status_var.set("未添加新的媒体文件")
             return
 
+        prev_selected = self.selected_channel()
+
         if self.search_var.get():
             self.search_var.set("")
         else:
             self.apply_filter()
+
+        if is_append:
+            if prev_selected is not None:
+                try:
+                    idx = self.filtered.index(prev_selected)
+                    self.ch_list.selection_clear(0, tk.END)
+                    self.ch_list.selection_set(idx)
+                    self.ch_list.activate(idx)
+                    self.ch_list.see(idx)
+                except ValueError:
+                    pass
+            self.status_var.set("已追加 %d 个媒体文件到列表" % len(added))
+            return
 
         first = added[0]
         try:
@@ -2992,6 +4148,15 @@ class IPTVApp(tk.Tk):
                 "%s\n\n可稍后重试（文件 → 下载免安装 VLC 组件），或在“回看参数设置”里指定 PotPlayer 等外部播放器。" % msg)
 
     def _play_local_file(self, path, title):
+        self._stop_recording_for_switch()
+        try:
+            if not self.recording:
+                self.btn_rec.configure(style="Disabled.TButton")
+                self.btn_rec_stop.configure(style="Disabled.TButton")
+                self.btn_rec.state(["disabled"])
+                self.btn_rec_stop.state(["disabled"])
+        except Exception:
+            pass
         self._cancel_seek_status_timer()
         self._net_paused = False
         self.current_url = path
@@ -3050,6 +4215,11 @@ class IPTVApp(tk.Tk):
                 return
             self.player.audio_set_volume(self.vol_var.get())
             self.status_var.set("正在播放：%s" % title)
+            if self._muted:
+                try:
+                    self.player.audio_set_mute(True)
+                except Exception:
+                    pass
         except Exception as e:
             self.status_var.set("播放异常：%s" % e)
             messagebox.showwarning("播放失败", str(e), parent=self)
@@ -3070,6 +4240,14 @@ class IPTVApp(tk.Tk):
         self.current_url = url
         self.current_title = title
         self.current_live = live
+        if not self.recording:
+            try:
+                self.btn_rec.configure(style="TButton")
+                self.btn_rec_stop.configure(style="TButton")
+                self.btn_rec.state(["!disabled"])
+                self.btn_rec_stop.state(["!disabled"])
+            except Exception:
+                pass
         if self.player is not None:
             media = self.vlc_instance.media_new(url)
             low = url.lower()
@@ -3083,9 +4261,15 @@ class IPTVApp(tk.Tk):
             self.player.set_media(media)
             self.player.play()
             self.player.audio_set_volume(self.vol_var.get())
+            if self._muted:
+                try:
+                    self.player.audio_set_mute(True)
+                except Exception:
+                    pass
         else:
             self.play_external(url)
-        self.status_var.set("正在播放：%s" % title)
+        if not self.recording:
+            self.status_var.set("正在播放：%s" % title)
 
     def play_external(self, url):
         self.kill_external()
@@ -3135,6 +4319,8 @@ class IPTVApp(tk.Tk):
         if not ch:
             messagebox.showinfo("提示", "请先选择频道")
             return
+
+        self._stop_recording_for_switch()
 
         if ch.get("webdav"):
             if ch.get("exit_browse"):
@@ -3247,9 +4433,10 @@ class IPTVApp(tk.Tk):
         if active:
             self.player.stop()
             self.play_url(self.current_url, self.current_title, self.current_live)
-            self.status_var.set("已切换（硬解=%s, RTSP-TCP=%s）并重新播放：%s" % (
-                "开" if self.cfg["hw_decode"] else "关",
-                "开" if self.cfg["rtsp_tcp"] else "关", self.current_title))
+            if not self.recording:
+                self.status_var.set("已切换（硬解=%s, RTSP-TCP=%s）并重新播放：%s" % (
+                    "开" if self.cfg["hw_decode"] else "关",
+                    "开" if self.cfg["rtsp_tcp"] else "关", self.current_title))
 
     def toggle_pause(self):
         if self.player is None:
@@ -3300,11 +4487,44 @@ class IPTVApp(tk.Tk):
         self.current = None
         self.current_url = ""
         self.time_var.set("--:--:-- / --:--:--")
-        self.status_var.set("已停止")
+        if not self.recording:
+            self.status_var.set("已停止")
+
+    def toggle_mute(self):
+        self._muted = not self._muted
+        try:
+            if self._muted:
+                self.btn_mute.configure(text="🔇", style="Muted.TButton")
+                if self.player is not None:
+                    try:
+                        self.player.audio_set_mute(True)
+                    except Exception:
+                        pass
+                self.status_var.set("已静音")
+            else:
+                self.btn_mute.configure(text="🔊", style="TButton")
+                if self.player is not None:
+                    try:
+                        self.player.audio_set_mute(False)
+                    except Exception:
+                        pass
+                self.status_var.set("已取消静音")
+        except Exception:
+            pass
 
     def on_volume(self, _v=None):
         v = int(float(self.vol_var.get()))
+        if self._muted and v > 0:
+            self._muted = False
+            try:
+                self.btn_mute.configure(text="🔊", style="TButton")
+            except Exception:
+                pass
         if self.player is not None:
+            try:
+                self.player.audio_set_mute(False)
+            except Exception:
+                pass
             self.player.audio_set_volume(v)
         self.cfg["volume"] = v
 
@@ -3312,8 +4532,9 @@ class IPTVApp(tk.Tk):
         self.left_panel.grid_propagate(False)
         self.left_panel.pack_propagate(False)
         if self.left_visible:
+            _raw_left = int(self.cfg.get("left_width", 200))
             self.left_panel.configure(
-                width=max(150, min(600, int(self.cfg.get("left_width", 250)))))
+                width=max(150, min(600, int(_raw_left * 1))))
             return
         self.update_idletasks()
         w = 20
@@ -3403,7 +4624,7 @@ class IPTVApp(tk.Tk):
         self.right_panel.grid_remove()
         self.progress_frame.grid_remove()
         self.ctl_bar.grid_remove()
-        self.status_label.grid_remove()
+        self.status_bar.grid_remove()
         self.video.grid_configure(padx=0, pady=0)
 
         self._empty_menu = tk.Menu(self)
@@ -3424,7 +4645,7 @@ class IPTVApp(tk.Tk):
         self.video.grid(row=0, column=0, sticky="nsew", padx=4, pady=(6, 3))
         self.progress_frame.grid(row=1, column=0, sticky="ew", padx=6, pady=(2, 2))
         self.ctl_bar.grid(row=2, column=0, sticky="ew", padx=4, pady=3)
-        self.status_label.grid(row=3, column=0, sticky="ew", padx=4, pady=(3, 4))
+        self.status_bar.grid(row=3, column=0, sticky="ew", padx=4, pady=(3, 4))
 
         self.left_panel.grid(row=0, column=0, sticky="ns")
         self.left_panel.grid_rowconfigure(0, weight=1)
@@ -3512,10 +4733,28 @@ class IPTVApp(tk.Tk):
         center_window(win, self)
 
     def on_close(self):
+        if self.recording:
+            if not messagebox.askyesno(
+                    "正在录制",
+                    "当前正在录制：\n%s\n\n关闭程序会停止录制并保存已录内容。\n是否继续关闭？"
+                    % os.path.basename(self.rec_path)):
+                return
         self._cancel_seek_status_timer()
         if getattr(self, "_closing", False):
             return
         self._closing = True
+
+        try:
+            if self.recording:
+                self._stop_record_blocking()
+        except Exception:
+            pass
+        try:
+            if self.rec_proxy:
+                self.rec_proxy.stop()
+                self.rec_proxy = None
+        except Exception:
+            pass
 
         if self.epg_state:
             self.epg_state["cancel"] = True
@@ -3540,6 +4779,13 @@ class IPTVApp(tk.Tk):
             except Exception:
                 pass
             self._video_click_after_id = None
+
+        if self._rec_poll_id is not None:
+            try:
+                self.after_cancel(self._rec_poll_id)
+            except Exception:
+                pass
+            self._rec_poll_id = None
 
         self.save_config()
 
