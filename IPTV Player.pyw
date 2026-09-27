@@ -748,8 +748,8 @@ DEFAULT_CONFIG = {
     "template": "{base}?AuthInfo={authinfo}&userid={userid}&playseek={seek}",
     "tz_offset": 8,
     "replay_days": 7,
-    "volume": 80,
-    "left_width": 250,
+    "volume": 100,
+    "left_width": 200,
     "epg_auto_update": True,
     "epg_host": "http://123.147.117.163:8081",
     "epg_path": "/resource/schedules_v2/{channelcode}_{date}.json",
@@ -1642,6 +1642,10 @@ class IPTVApp(tk.Tk):
             self.cfg["left_width"] = int(self.cfg.get("left_width", 200))
         except Exception:
             self.cfg["left_width"] = 200
+        try:
+            self.cfg["volume"] = max(0, min(125, int(self.cfg.get("volume", 100))))
+        except Exception:
+            self.cfg["volume"] = 100
         if not isinstance(self.cfg.get("webdav_sources"), list):
             self.cfg["webdav_sources"] = []
         if "record_stop_on_switch" not in self.cfg:
@@ -1793,7 +1797,7 @@ class IPTVApp(tk.Tk):
         self.right_visible = bool(self.cfg.get("right_visible", False))
 
         _raw_left = int(self.cfg.get("left_width", 200))
-        left_w = max(150, min(600, int(_raw_left * 1)))
+        left_w = max(200, min(600, int(_raw_left * 1)))
         left = ttk.Frame(self, width=left_w, style="Panel.TFrame")
         left.grid(row=0, column=0, sticky="ns")
         left.grid_propagate(False)
@@ -1905,9 +1909,15 @@ class IPTVApp(tk.Tk):
         self.btn_mute = ttk.Button(ctl, text="🔊", width=2,
                                    command=self.toggle_mute)
         self.btn_mute.pack(side=tk.LEFT, padx=2)
-        self.vol_var = tk.IntVar(value=int(self.cfg.get("volume", 75)))
-        ttk.Scale(ctl, from_=0, to=100, variable=self.vol_var, length=100,
+        self.vol_var = tk.IntVar(value=int(self.cfg.get("volume", 100)))
+        ttk.Scale(ctl, from_=0, to=125, variable=self.vol_var, length=125,
                   command=self.on_volume).pack(side=tk.LEFT, padx=2)
+        self.vol_pct_var = tk.StringVar(value="%d%%" % self.vol_var.get())
+        self.vol_pct_label = ttk.Label(ctl, textvariable=self.vol_pct_var, width=5,
+                                       style="Dim.TLabel")
+        self.vol_pct_label.pack(side=tk.LEFT, padx=(4, 0))
+        self.vol_pct_label.bind("<Double-Button-1>",
+                                lambda e: (self.vol_var.set(100), self.on_volume()))
 
         self.status_var = tk.StringVar(value="就绪")
         self.status_bar = ttk.Frame(mid, style="Status.TFrame")
@@ -4513,7 +4523,11 @@ class IPTVApp(tk.Tk):
             pass
 
     def on_volume(self, _v=None):
-        v = int(float(self.vol_var.get()))
+        try:
+            v = int(self.vol_var.get())
+        except Exception:
+            v = 0
+        v = max(0, min(125, v))
         if self._muted and v > 0:
             self._muted = False
             try:
@@ -4527,6 +4541,10 @@ class IPTVApp(tk.Tk):
                 pass
             self.player.audio_set_volume(v)
         self.cfg["volume"] = v
+        try:
+            self.vol_pct_var.set("%d%%" % v)
+        except Exception:
+            pass
 
     def _apply_left_width(self):
         self.left_panel.grid_propagate(False)
@@ -4534,7 +4552,7 @@ class IPTVApp(tk.Tk):
         if self.left_visible:
             _raw_left = int(self.cfg.get("left_width", 200))
             self.left_panel.configure(
-                width=max(150, min(600, int(_raw_left * 1))))
+                width=max(200, min(600, int(_raw_left * 1))))
             return
         self.update_idletasks()
         w = 20
