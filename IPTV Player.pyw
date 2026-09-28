@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta, timezone
 
-CODE_VERSION = "IPTV Player v2026.09.27"
+CODE_VERSION = "IPTV Player v2026.09.28"
 
 PY_BITS = struct.calcsize("P") * 8
 SEEK_GRANULARITY = 5
@@ -741,9 +741,9 @@ DEFAULT_CONFIG = {
     "authinfo": "xxx",
     "replay_player": "",
     "cfg_ver": 2,
-    "auto_install_vlc": True,
-    "hw_decode": True,
-    "rtsp_tcp": True,
+    "auto_install_vlc": False,
+    "hw_decode": False,
+    "rtsp_tcp": False,
     "http_replay_keys": ["/rtsp/"],
     "template": "{base}?AuthInfo={authinfo}&userid={userid}&playseek={seek}",
     "tz_offset": 8,
@@ -2112,12 +2112,12 @@ class IPTVApp(tk.Tk):
                               "-crf", "23",
                               "-pix_fmt", "yuv420p"]
 
-            if a_codec == "aac":
-                audio_args = ["-c:a", "copy", "-bsf:a", "aac_adtstoasc"]
-            elif a_codec in ("mp3", "ac3", "eac3", "alac", "flac"):
+            mp4_copy_safe = {"mp3", "ac3", "eac3", "alac", "flac"}
+            if a_codec in mp4_copy_safe:
                 audio_args = ["-c:a", "copy"]
             else:
-                audio_args = ["-c:a", "aac", "-b:a", "128k", "-ac", "2"]
+                audio_args = ["-c:a", "aac", "-b:a", "128k",
+                              "-ac", "2", "-strict", "-2",]
 
             cmd += ["-map", "0:v:0?", "-map", "0:a:0?"]
             cmd += video_args
@@ -2128,6 +2128,7 @@ class IPTVApp(tk.Tk):
                 "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
                 out_path,
             ]
+
         else:
             ffprobe = find_ffprobe(ffmpeg)
             kb = nearest_mp3_bitrate(
