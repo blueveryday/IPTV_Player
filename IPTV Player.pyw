@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta, timezone
 
-CODE_VERSION = "IPTV Player v2026.09.28"
+CODE_VERSION = "IPTV Player v2026.09.29"
 
 PY_BITS = struct.calcsize("P") * 8
 SEEK_GRANULARITY = 5
@@ -851,6 +851,43 @@ class SeekBar(tk.Canvas):
         self.set_value(v)
         if self._on_seek:
             self._on_seek(v, "commit")
+
+
+class PanelToggle(tk.Canvas):
+    """面板折叠/展开按钮：两根很短的竖线，位置固定。"""
+
+    def __init__(self, master, command=None, width=14, height=46, **kw):
+        super().__init__(master, width=width, height=height,
+                         bg=COLORS["bg_panel"], highlightthickness=0, bd=0,
+                         cursor="hand2", takefocus=0, **kw)
+        self._command = command
+        self._hover = False
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+        self.bind("<Configure>", lambda e: self._redraw())
+
+    def _on_click(self, _e=None):
+        if self._command:
+            self._command()
+
+    def _set_hover(self, on):
+        self._hover = on
+        self._redraw()
+
+    def _redraw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        cx, cy = w // 2, h // 2
+        color = COLORS["accent"] if self._hover else COLORS["fg_secondary"]
+        half = 7
+        gap = 2
+        self.create_line(cx - gap, cy - half, cx - gap, cy + half,
+                         fill=color, width=2)
+        self.create_line(cx + gap, cy - half, cx + gap, cy + half,
+                         fill=color, width=2)
 
 
 def read_text_auto(path):
@@ -1683,7 +1720,6 @@ class IPTVApp(tk.Tk):
         m.add_command(label="重新加载", command=self.load_default)
         m.add_separator()
         m.add_command(label="回看参数设置...", command=self.open_settings)
-        m.add_command(label="下载免安装 VLC 组件...", command=self.manual_portable_download)
         m.add_separator()
         m.add_command(label="退出", command=self.on_close)
         menubar.add_cascade(label="文件", menu=m)
@@ -1798,8 +1834,24 @@ class IPTVApp(tk.Tk):
 
         _raw_left = int(self.cfg.get("left_width", 200))
         left_w = max(200, min(600, int(_raw_left * 1)))
-        left = ttk.Frame(self, width=left_w, style="Panel.TFrame")
-        left.grid(row=0, column=0, sticky="ns")
+
+        # ---------------- 左侧外壳（按钮列 + 面板） ----------------
+        left_holder = ttk.Frame(self, style="Panel.TFrame")
+        left_holder.grid(row=0, column=0, sticky="ns")
+        left_holder.grid_rowconfigure(0, weight=1)
+        self.left_holder = left_holder
+
+        left_btn_col = ttk.Frame(left_holder, style="Panel.TFrame")
+        left_btn_col.grid(row=0, column=0, sticky="ns")
+        left_btn_col.grid_rowconfigure(0, weight=1)
+        left_btn_col.grid_rowconfigure(2, weight=1)
+        self.left_btn_col = left_btn_col
+        self.left_btn = PanelToggle(left_btn_col, command=self.toggle_left,
+                                    width=14, height=46)
+        self.left_btn.grid(row=1, column=0)
+
+        left = ttk.Frame(left_holder, width=left_w, style="Panel.TFrame")
+        left.grid(row=0, column=1, sticky="ns")
         left.grid_propagate(False)
         left.pack_propagate(False)
         self.left_panel = left
@@ -1809,12 +1861,13 @@ class IPTVApp(tk.Tk):
         self.left_body = ttk.Frame(left, style="Panel.TFrame")
         self.left_body.grid(row=0, column=0, sticky="nsew")
 
+        # ===== 左侧面板内容（频道列表） =====
         wf = ttk.Frame(self.left_body, style="Panel.TFrame")
         wf.pack(fill=tk.X, padx=8, pady=(8, 2))
         ttk.Label(wf, text="快捷菜单", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 6))
         self.webdav_var = tk.StringVar()
         self.webdav_cb = ttk.Combobox(wf, textvariable=self.webdav_var,
-                              state="readonly", width=1)
+                                      state="readonly", width=1)
         self.webdav_cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.webdav_cb.bind("<<ComboboxSelected>>", self._on_webdav_combo)
         self._webdav_combo_sources = []
@@ -1851,17 +1904,9 @@ class IPTVApp(tk.Tk):
         self.count_var = tk.StringVar(value="0 个频道")
         ttk.Label(self.left_body, textvariable=self.count_var,
                   style="Dim.TLabel").pack(anchor="w", padx=10, pady=(2, 8))
+        # ===== 左侧面板内容结束 =====
 
-        left_btn_col = ttk.Frame(left, style="Panel.TFrame")
-        left_btn_col.grid(row=0, column=1, sticky="ns")
-        left_btn_col.grid_rowconfigure(0, weight=1)
-        left_btn_col.grid_rowconfigure(2, weight=1)
-        self.left_btn_col = left_btn_col
-        self.left_btn = ttk.Button(left_btn_col, text="◀", width=1,
-                                   style="Arrow.TButton",
-                                   command=self.toggle_left, takefocus=0)
-        self.left_btn.grid(row=1, column=0)
-
+        # ---------------- 中部：播放区 ----------------
         mid = ttk.Frame(self)
         mid.grid(row=0, column=1, sticky="nsew")
         self.mid_panel = mid
@@ -1930,25 +1975,31 @@ class IPTVApp(tk.Tk):
                                    style="Rec.TLabel", anchor="e")
         self.rec_label.grid(row=0, column=1, sticky="e")
 
-        right = ttk.Frame(self, style="Panel.TFrame")
-        right.grid(row=0, column=2, sticky="ns")
-        self.right_panel = right
-        right.grid_rowconfigure(0, weight=1)
-        right.grid_columnconfigure(1, weight=1)
+        # ---------------- 右侧外壳（面板 + 按钮列） ----------------
+        right_holder = ttk.Frame(self, style="Panel.TFrame")
+        right_holder.grid(row=0, column=2, sticky="ns")
+        right_holder.grid_rowconfigure(0, weight=1)
+        self.right_holder = right_holder
 
-        right_btn_col = ttk.Frame(right, style="Panel.TFrame")
-        right_btn_col.grid(row=0, column=0, sticky="ns")
+        right = ttk.Frame(right_holder, style="Panel.TFrame")
+        right.grid(row=0, column=0, sticky="ns")
+        right.grid_rowconfigure(0, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+        self.right_panel = right
+
+        self.right_body = ttk.Frame(right, style="Panel.TFrame")
+        self.right_body.grid(row=0, column=0, sticky="nsew")
+
+        right_btn_col = ttk.Frame(right_holder, style="Panel.TFrame")
+        right_btn_col.grid(row=0, column=1, sticky="ns")
         right_btn_col.grid_rowconfigure(0, weight=1)
         right_btn_col.grid_rowconfigure(2, weight=1)
         self.right_btn_col = right_btn_col
-        self.right_btn = ttk.Button(right_btn_col, text="▶", width=1,
-                                    style="Arrow.TButton",
-                                    command=self.toggle_right, takefocus=0)
+        self.right_btn = PanelToggle(right_btn_col, command=self.toggle_right,
+                                     width=14, height=46)
         self.right_btn.grid(row=1, column=0)
 
-        self.right_body = ttk.Frame(right, style="Panel.TFrame")
-        self.right_body.grid(row=0, column=1, sticky="nsew")
-
+        # ===== 右侧面板内容（EPG/回看） =====
         self.replay_ch_var = tk.StringVar(value="未选择频道")
         ttk.Label(self.right_body, textvariable=self.replay_ch_var,
                   style="Dim.TLabel", wraplength=260,
@@ -2013,6 +2064,7 @@ class IPTVApp(tk.Tk):
         ttk.Button(self.right_body, text="打开录制目录",
                    command=self.open_record_dir).pack(
             fill=tk.X, padx=8, pady=(3, 8))
+        # ===== 右侧面板内容结束 =====
 
         self._apply_left_visible()
         self._apply_right_visible()
@@ -2390,9 +2442,9 @@ class IPTVApp(tk.Tk):
             elapsed = 0
         h, r = divmod(elapsed, 3600)
         m, s = divmod(r, 60)
-        tag = "录像" if self.rec_mode == "video" else "录音"
-        self.rec_var.set("● %s %02d:%02d:%02d  %s" % (
-            tag, h, m, s, os.path.basename(self.rec_path)))
+        tag = "正在录像" if self.rec_mode == "video" else "正在录音"
+        self.rec_var.set("● %s %02d:%02d:%02d" % (tag, h, m, s))
+        
         self._rec_poll_id = self.after(1000, self._update_rec_status)
 
     def stop_record(self):
@@ -2647,7 +2699,7 @@ class IPTVApp(tk.Tk):
             ch["name"], new_time.strftime("%Y-%m-%d %H:%M:%S"),
             now.strftime("%H:%M:%S"))
         self.play_url(url, title, live=False)
-        self.status_var.set("已前进到 %s 回看" % new_time.strftime("%H:%M:%S"))
+        self._flash_seek_status("已前进至 %s 回看" % new_time.strftime("%H:%M:%S"))
 
     def _find_epg_bounds_for_now(self, ch, now):
         progs = load_epg(ch["name"], now.date())
@@ -2688,8 +2740,8 @@ class IPTVApp(tk.Tk):
         if new_time < self.replay_range_start:
             new_time = self.replay_range_start
         if new_time >= self.replay_anchor_time:
-            self.status_var.set("已到达该时段最早时间（%s），无法继续倒退" %
-                                self.replay_range_start.strftime("%H:%M:%S"))
+            self._flash_seek_status("已到达该时段最早时间（%s），无法继续倒退" %
+                                    self.replay_range_start.strftime("%H:%M:%S"))
             return
         self.replay_anchor_time = new_time
         self.replay_anchor_wall = now
@@ -2706,7 +2758,7 @@ class IPTVApp(tk.Tk):
             ch["name"], new_time.strftime("%Y-%m-%d %H:%M:%S"),
             now.strftime("%H:%M:%S"))
         self.play_url(url, title, live=False)
-        self.status_var.set("已倒推到 %s 回看" % new_time.strftime("%H:%M:%S"))
+        self._flash_seek_status("已倒退至 %s 回看" % new_time.strftime("%H:%M:%S"))
 
     def _resume_live(self):
         ch = self.current
@@ -2715,7 +2767,7 @@ class IPTVApp(tk.Tk):
         self._clear_replay_range()
         self.play_url(ch["url"], "[直播] " + ch["name"], live=True)
         self._refresh_live_bar()
-        self.status_var.set("已恢复直播：%s" % ch["name"])
+        self._flash_seek_status("已恢复直播：%s" % ch["name"])
 
     def _on_arrow_left(self, event=None):
         if self._focus_is_text_input():
@@ -2974,6 +3026,10 @@ class IPTVApp(tk.Tk):
         if getattr(self, "_closing", False):
             return
         if self.recording:
+            if self.rec_path:
+                label = "录像" if self.rec_mode == "video" else "录音"
+                self.status_var.set("正在%s：%s" % (
+                    label, os.path.basename(self.rec_path)))
             return
         if not self.current_url:
             return
@@ -3081,14 +3137,19 @@ class IPTVApp(tk.Tk):
                 now = self.local_now()
                 if self._live_rewind_mode:
                     self.replay_range_end = now
-                    cur = self.replay_anchor_time
-                    right = now
-                else:
-                    elapsed = (now - self.replay_anchor_wall).total_seconds()
-                    cur = self.replay_anchor_time + timedelta(seconds=elapsed)
-                    if cur > self.replay_range_end:
-                        cur = self.replay_range_end
-                    right = self.replay_range_end
+
+                right = now
+
+                offset_sec = int(round(
+                    (self.replay_anchor_time
+                     - self.replay_anchor_wall).total_seconds()))
+                cur = now + timedelta(seconds=offset_sec)
+
+                if cur < self.replay_range_start:
+                    cur = self.replay_range_start
+                if cur > self.replay_range_end:
+                    cur = self.replay_range_end
+
                 total_sec = (self.replay_range_end
                              - self.replay_range_start).total_seconds()
                 if total_sec > 0:
@@ -3175,7 +3236,7 @@ class IPTVApp(tk.Tk):
             ch["name"], target.strftime("%Y-%m-%d %H:%M:%S"),
             self.replay_range_end.strftime("%H:%M:%S"))
         self.play_url(url, title, live=False)
-        self.status_var.set("已跳转到 %s 继续回看" % target.strftime("%H:%M:%S"))
+        self._flash_seek_status("已跳转到 %s" % target.strftime("%H:%M:%S"))
 
     def local_now(self):
         utc = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -4486,7 +4547,7 @@ class IPTVApp(tk.Tk):
             except Exception:
                 pass
             self._net_paused = True
-            self.status_var.set("已暂停（再按空格 / 点击画面继续）")
+            self._flash_seek_status("已暂停（再按空格或点击画面继续）")
 
     def stop(self):
         self._cancel_seek_status_timer()
@@ -4511,7 +4572,7 @@ class IPTVApp(tk.Tk):
                         self.player.audio_set_mute(True)
                     except Exception:
                         pass
-                self.status_var.set("已静音")
+                self._flash_seek_status("已静音")
             else:
                 self.btn_mute.configure(text="🔊", style="TButton")
                 if self.player is not None:
@@ -4519,7 +4580,7 @@ class IPTVApp(tk.Tk):
                         self.player.audio_set_mute(False)
                     except Exception:
                         pass
-                self.status_var.set("已取消静音")
+                self._flash_seek_status("已取消静音")
         except Exception:
             pass
 
@@ -4547,39 +4608,19 @@ class IPTVApp(tk.Tk):
         except Exception:
             pass
 
-    def _apply_left_width(self):
-        self.left_panel.grid_propagate(False)
-        self.left_panel.pack_propagate(False)
-        if self.left_visible:
-            _raw_left = int(self.cfg.get("left_width", 200))
-            self.left_panel.configure(
-                width=max(200, min(600, int(_raw_left * 1))))
-            return
-        self.update_idletasks()
-        w = 20
-        src = self.right_btn_col if self.right_btn_col is not None else self.left_btn_col
-        if src is not None:
-            rw = src.winfo_reqwidth()
-            if rw > 0:
-                w = rw
-        self.left_panel.configure(width=w)
-
     def _apply_left_visible(self):
         if self.left_visible:
-            self.left_body.grid(row=0, column=0, sticky="nsew")
-            self.left_btn.config(text="◀")
+            _raw_left = int(self.cfg.get("left_width", 200))
+            self.left_panel.configure(width=max(200, min(600, _raw_left)))
+            self.left_panel.grid()
         else:
-            self.left_body.grid_remove()
-            self.left_btn.config(text="▶")
-        self._apply_left_width()
+            self.left_panel.grid_remove()
 
     def _apply_right_visible(self):
         if self.right_visible:
-            self.right_body.grid(row=0, column=1, sticky="nsew")
-            self.right_btn.config(text="▶")
+            self.right_panel.grid()
         else:
-            self.right_body.grid_remove()
-            self.right_btn.config(text="◀")
+            self.right_panel.grid_remove()
 
     def toggle_left(self):
         if self.fullscreen:
@@ -4639,8 +4680,8 @@ class IPTVApp(tk.Tk):
             return
         self.fullscreen = True
 
-        self.left_panel.grid_remove()
-        self.right_panel.grid_remove()
+        self.left_holder.grid_remove()
+        self.right_holder.grid_remove()
         self.progress_frame.grid_remove()
         self.ctl_bar.grid_remove()
         self.status_bar.grid_remove()
@@ -4666,22 +4707,13 @@ class IPTVApp(tk.Tk):
         self.ctl_bar.grid(row=2, column=0, sticky="ew", padx=4, pady=3)
         self.status_bar.grid(row=3, column=0, sticky="ew", padx=4, pady=(3, 4))
 
-        self.left_panel.grid(row=0, column=0, sticky="ns")
-        self.left_panel.grid_rowconfigure(0, weight=1)
-        self.left_panel.grid_columnconfigure(0, weight=1)
-        if self.left_visible:
-            self.left_body.grid(row=0, column=0, sticky="nsew")
-        else:
-            self.left_body.grid_remove()
-        self._apply_left_width()
+        self.left_holder.grid(row=0, column=0, sticky="ns")
+        self.left_holder.grid_rowconfigure(0, weight=1)
+        self.right_holder.grid(row=0, column=2, sticky="ns")
+        self.right_holder.grid_rowconfigure(0, weight=1)
 
-        self.right_panel.grid(row=0, column=2, sticky="ns")
-        self.right_panel.grid_rowconfigure(0, weight=1)
-        self.right_panel.grid_columnconfigure(1, weight=1)
-        if self.right_visible:
-            self.right_body.grid(row=0, column=1, sticky="nsew")
-        else:
-            self.right_body.grid_remove()
+        self._apply_left_visible()
+        self._apply_right_visible()
 
         self.update_idletasks()
         self.focus_set()
