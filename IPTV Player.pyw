@@ -492,7 +492,7 @@ def _hls_is_disguised(text):
 
 class HLSRewriteProxy(object):
 
-    def __init__(self, origin_url, headers=None, timeout=30, fetch_retries=3):
+    def __init__(self, origin_url, headers=None, timeout=10, fetch_retries=5):
         self.origin_url = origin_url
         self.headers = dict(_HLS_PROXY_UA)
         if headers:
@@ -501,8 +501,9 @@ class HLSRewriteProxy(object):
         try:
             self.fetch_retries = max(1, int(fetch_retries))
         except Exception:
-            self.fetch_retries = 3
+            self.fetch_retries = 5
         self._token_map = {}
+        self._resp_cache = {}
         self._lock = threading.Lock()
         self._httpd = None
         self._thread = None
@@ -658,21 +659,37 @@ class HLSRewriteProxy(object):
         self._proxy_playlist(handler, self.origin_url)
 
     def _proxy_playlist(self, handler, real_url):
+        body = None
+        final_url = None
         try:
             body, final_url = self._fetch(real_url)
+            with self._lock:
+                self._resp_cache[real_url] = (body, final_url)
         except Exception as e:
-            try:
-                sys.stderr.write(
-                    "[HLS-proxy] playlist fetch failed: %s (%s)\n"
-                    % (real_url, e))
-                sys.stderr.flush()
-            except Exception:
-                pass
-            try:
-                handler.send_error(503, "upstream fetch failed")
-            except Exception:
-                pass
-            return
+            with self._lock:
+                cached = self._resp_cache.get(real_url)
+            if cached is not None:
+                body, final_url = cached
+                try:
+                    sys.stderr.write(
+                        "[HLS-proxy] playlist fetch failed, using cache: %s (%s)\n"
+                        % (real_url, e))
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+            else:
+                try:
+                    sys.stderr.write(
+                        "[HLS-proxy] playlist fetch failed: %s (%s)\n"
+                        % (real_url, e))
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                try:
+                    handler.send_error(503, "upstream fetch failed")
+                except Exception:
+                    pass
+                return
 
         text = body.decode("utf-8", "replace")
         host = handler.headers.get("Host") or ("127.0.0.1:%d" % self.port)
@@ -700,21 +717,29 @@ class HLSRewriteProxy(object):
             handler.send_error(404)
             return
 
+        data = None
         try:
             data, _ = self._fetch(real)
+            with self._lock:
+                self._resp_cache[real] = (data, real)
         except Exception as e:
-            try:
-                sys.stderr.write(
-                    "[HLS-proxy] segment fetch failed: %s (%s)\n"
-                    % (real, e))
-                sys.stderr.flush()
-            except Exception:
-                pass
-            try:
-                handler.send_error(503, "upstream fetch failed")
-            except Exception:
-                pass
-            return
+            with self._lock:
+                cached = self._resp_cache.get(real)
+            if cached is not None:
+                data = cached[0]
+            else:
+                try:
+                    sys.stderr.write(
+                        "[HLS-proxy] segment fetch failed: %s (%s)\n"
+                        % (real, e))
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                try:
+                    handler.send_error(503, "upstream fetch failed")
+                except Exception:
+                    pass
+                return
 
         if data[:7] == b"#EXTM3U":
             text = data.decode("utf-8", "replace")
@@ -854,7 +879,6 @@ class SeekBar(tk.Canvas):
 
 
 class PanelToggle(tk.Canvas):
-    """面板折叠/展开按钮：两根很短的竖线，位置固定。"""
 
     def __init__(self, master, command=None, width=14, height=46, **kw):
         super().__init__(master, width=width, height=height,
@@ -1512,6 +1536,8 @@ class IPTVApp(tk.Tk):
         self._rec_probing = False
         self._rec_probe_url = None
         self.rec_proxy = None
+        self._audio_poster_img = None
+        self.audio_poster = None
 
         self._setup_ttk_style()
         self.build_menu()
@@ -1835,7 +1861,6 @@ class IPTVApp(tk.Tk):
         _raw_left = int(self.cfg.get("left_width", 200))
         left_w = max(200, min(600, int(_raw_left * 1)))
 
-        # ---------------- 左侧外壳（按钮列 + 面板） ----------------
         left_holder = ttk.Frame(self, style="Panel.TFrame")
         left_holder.grid(row=0, column=0, sticky="ns")
         left_holder.grid_rowconfigure(0, weight=1)
@@ -1861,7 +1886,6 @@ class IPTVApp(tk.Tk):
         self.left_body = ttk.Frame(left, style="Panel.TFrame")
         self.left_body.grid(row=0, column=0, sticky="nsew")
 
-        # ===== 左侧面板内容（频道列表） =====
         wf = ttk.Frame(self.left_body, style="Panel.TFrame")
         wf.pack(fill=tk.X, padx=8, pady=(8, 2))
         ttk.Label(wf, text="快捷菜单", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 6))
@@ -1904,9 +1928,7 @@ class IPTVApp(tk.Tk):
         self.count_var = tk.StringVar(value="0 个频道")
         ttk.Label(self.left_body, textvariable=self.count_var,
                   style="Dim.TLabel").pack(anchor="w", padx=10, pady=(2, 8))
-        # ===== 左侧面板内容结束 =====
 
-        # ---------------- 中部：播放区 ----------------
         mid = ttk.Frame(self)
         mid.grid(row=0, column=1, sticky="nsew")
         self.mid_panel = mid
@@ -1918,6 +1940,12 @@ class IPTVApp(tk.Tk):
         self.video.bind("<Button-1>", self._on_video_click)
         self.video.bind("<Double-Button-1>", self._on_video_double_click)
         self.video.bind("<Button-3>", self._on_video_right_click)
+
+        self.audio_poster = tk.Label(
+            self.video, bg=COLORS["bg_video"], bd=0,
+            highlightthickness=0,
+            font=("Segoe UI Emoji", 64),
+            fg=COLORS["fg_secondary"])
 
         pg = ttk.Frame(mid)
         pg.grid(row=1, column=0, sticky="ew", padx=6, pady=(2, 2))
@@ -1975,7 +2003,6 @@ class IPTVApp(tk.Tk):
                                    style="Rec.TLabel", anchor="e")
         self.rec_label.grid(row=0, column=1, sticky="e")
 
-        # ---------------- 右侧外壳（面板 + 按钮列） ----------------
         right_holder = ttk.Frame(self, style="Panel.TFrame")
         right_holder.grid(row=0, column=2, sticky="ns")
         right_holder.grid_rowconfigure(0, weight=1)
@@ -1999,7 +2026,6 @@ class IPTVApp(tk.Tk):
                                      width=14, height=46)
         self.right_btn.grid(row=1, column=0)
 
-        # ===== 右侧面板内容（EPG/回看） =====
         self.replay_ch_var = tk.StringVar(value="未选择频道")
         ttk.Label(self.right_body, textvariable=self.replay_ch_var,
                   style="Dim.TLabel", wraplength=260,
@@ -2064,7 +2090,6 @@ class IPTVApp(tk.Tk):
         ttk.Button(self.right_body, text="打开录制目录",
                    command=self.open_record_dir).pack(
             fill=tk.X, padx=8, pady=(3, 8))
-        # ===== 右侧面板内容结束 =====
 
         self._apply_left_visible()
         self._apply_right_visible()
@@ -2220,8 +2245,11 @@ class IPTVApp(tk.Tk):
             is_hls = False
         if not is_hls:
             return url, None
+        low = url.lower()
+        if ("playseek=" in low or "authinfo=" in low or "userid=" in low):
+            return url, None
         try:
-            proxy = HLSRewriteProxy(url)
+            proxy = HLSRewriteProxy(url, timeout=10, fetch_retries=5)
             proxy.start()
             return proxy.playlist_url(), proxy
         except Exception:
@@ -2444,7 +2472,7 @@ class IPTVApp(tk.Tk):
         m, s = divmod(r, 60)
         tag = "正在录像" if self.rec_mode == "video" else "正在录音"
         self.rec_var.set("● %s %02d:%02d:%02d" % (tag, h, m, s))
-        
+
         self._rec_poll_id = self.after(1000, self._update_rec_status)
 
     def stop_record(self):
@@ -3882,6 +3910,8 @@ class IPTVApp(tk.Tk):
             url = urllib.parse.urlunparse(
                 (p.scheme, netloc, p.path, p.params, p.query, p.fragment))
 
+        raw_name = item.get("raw_name", item["name"])
+        self._show_audio_poster(self._is_audio_name(raw_name))
         self._net_paused = False
         self.current = item
         self.current_url = url
@@ -4229,6 +4259,8 @@ class IPTVApp(tk.Tk):
                 self.btn_rec_stop.state(["disabled"])
         except Exception:
             pass
+        self._show_audio_poster(self._guess_media_kind(path) == "audio")
+
         self._cancel_seek_status_timer()
         self._net_paused = False
         self.current_url = path
@@ -4302,6 +4334,49 @@ class IPTVApp(tk.Tk):
             p = "/" + p
         return "file://" + urllib.parse.quote(p, safe="/:")
 
+    def _load_audio_poster(self, max_size=200):
+        ico = os.path.join(APP_DIR, "src", "asset", "iptv.ico")
+        if not os.path.isfile(ico):
+            return None
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(ico).convert("RGBA")
+            img.thumbnail((max_size, max_size), Image.LANCZOS)
+            return ImageTk.PhotoImage(img)
+        except Exception:
+            pass
+        base = os.path.splitext(ico)[0]
+        for ext in (".png", ".gif"):
+            cand = base + ext
+            if os.path.isfile(cand):
+                try:
+                    return tk.PhotoImage(file=cand)
+                except Exception:
+                    pass
+        return None
+
+    def _show_audio_poster(self, show):
+        if self.audio_poster is None:
+            return
+        if show:
+            if self._audio_poster_img is None:
+                self._audio_poster_img = self._load_audio_poster()
+            if self._audio_poster_img is not None:
+                self.audio_poster.configure(image=self._audio_poster_img,
+                                            text="")
+            else:
+                self.audio_poster.configure(image="", text="🎵")
+            try:
+                self.audio_poster.place(relx=0.5, rely=0.5, anchor="center")
+                self.audio_poster.lift()
+            except Exception:
+                pass
+        else:
+            try:
+                self.audio_poster.place_forget()
+            except Exception:
+                pass
+
     def play_url(self, url, title, live=True):
         self._cancel_seek_status_timer()
         self._net_paused = False
@@ -4309,6 +4384,7 @@ class IPTVApp(tk.Tk):
             self._play_local_file(url, title)
             return
 
+        self._show_audio_poster(self._guess_media_kind(url) == "audio")
         self.current_url = url
         self.current_title = title
         self.current_live = live
@@ -4559,6 +4635,7 @@ class IPTVApp(tk.Tk):
         self.current = None
         self.current_url = ""
         self.time_var.set("--:--:-- / --:--:--")
+        self._show_audio_poster(False)
         if not self.recording:
             self.status_var.set("已停止")
 
