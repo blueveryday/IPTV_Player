@@ -999,6 +999,29 @@ def parse_m3u(path):
     return channels
 
 
+def scan_local_m3u_files():
+    files = []
+    try:
+        entries = sorted(os.listdir(APP_DIR), key=lambda s: s.lower())
+    except OSError:
+        return files
+    default_norm = os.path.normcase(os.path.abspath(DEFAULT_M3U))
+    for name in entries:
+        low = name.lower()
+        if not (low.endswith(".m3u") or low.endswith(".m3u8")):
+            continue
+        p = os.path.join(APP_DIR, name)
+        try:
+            if not os.path.isfile(p):
+                continue
+        except OSError:
+            continue
+        if os.path.normcase(os.path.abspath(p)) == default_norm:
+            continue
+        files.append((name, p))
+    return files
+
+
 class WebDAVClient:
     def __init__(self, url, user="", password="", timeout=15):
         url = (url or "").strip()
@@ -1522,6 +1545,7 @@ class IPTVApp(tk.Tk):
         self.webdav_path = ""
         self.webdav_items = []
         self._webdav_req_id = 0
+        self.current_m3u_path = ""
 
         self.recording = False
         self.rec_proc = None
@@ -1538,6 +1562,8 @@ class IPTVApp(tk.Tk):
         self.rec_proxy = None
         self._audio_poster_img = None
         self.audio_poster = None
+        self._poster_check_id = None
+        self._poster_check_tries = 0
 
         self._setup_ttk_style()
         self.build_menu()
@@ -1894,6 +1920,7 @@ class IPTVApp(tk.Tk):
                                       state="readonly", width=1)
         self.webdav_cb.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.webdav_cb.bind("<<ComboboxSelected>>", self._on_webdav_combo)
+        self.webdav_cb.bind("<Button-1>", self._on_webdav_combo_prepare, add="+")
         self._webdav_combo_sources = []
         self._refresh_webdav_combo()
 
@@ -3738,7 +3765,12 @@ class IPTVApp(tk.Tk):
         sources = list(self.cfg.get("webdav_sources") or [])
         self._webdav_combo_sources = sources
 
+        m3u_list = scan_local_m3u_files()
+        self._webdav_combo_m3u = m3u_list
+
         names = ["📄 IPTV(本地)"]
+        for name, _p in m3u_list:
+            names.append("📺 " + name)
         for s in sources:
             names.append("🌐 " + (s.get("name") or s.get("url") or "?"))
 
@@ -3751,8 +3783,18 @@ class IPTVApp(tk.Tk):
             except ValueError:
                 idx = 0
             self.webdav_var.set(names[idx])
-        else:
+            return
+
+        cur_path = os.path.normcase(os.path.abspath(self.current_m3u_path)) \
+            if self.current_m3u_path else ""
+        if cur_path and cur_path == os.path.normcase(os.path.abspath(DEFAULT_M3U)):
             self.webdav_var.set(names[0])
+            return
+        for i, (_n, p) in enumerate(m3u_list):
+            if cur_path and os.path.normcase(os.path.abspath(p)) == cur_path:
+                self.webdav_var.set(names[1 + i])
+                return
+        self.webdav_var.set(names[0])
 
     def _on_webdav_combo(self, event=None):
         idx = self.webdav_cb.current()
@@ -3768,17 +3810,33 @@ class IPTVApp(tk.Tk):
             self.status_var.set("已切换到本地IPTV列表：%s" % DEFAULT_M3U)
             return
 
-        src_idx = idx - 1
+        m3u_list = getattr(self, "_webdav_combo_m3u", [])
+        m3u_count = len(m3u_list)
+        if idx <= m3u_count:
+            _name, path = m3u_list[idx - 1]
+            if not os.path.isfile(path):
+                self.status_var.set("文件不存在：%s" % path)
+                self._refresh_webdav_combo()
+                return
+            self.load_m3u(path)
+            self.status_var.set("已加载：%s" % path)
+            return
+
+        src_idx = idx - 1 - m3u_count
         if src_idx >= len(self._webdav_combo_sources):
             return
         src = self._webdav_combo_sources[src_idx]
-
         if (self.webdav_mode and self.webdav_source
                 and self.webdav_source.get("url") == src.get("url")
                 and self.webdav_source.get("user") == src.get("user")):
             return
-
         self._enter_webdav(dict(src))
+
+    def _on_webdav_combo_prepare(self, event=None):
+        try:
+            self._refresh_webdav_combo()
+        except Exception:
+            pass
 
     def _enter_webdav(self, source):
         self.webdav_mode = True
@@ -3911,7 +3969,6 @@ class IPTVApp(tk.Tk):
                 (p.scheme, netloc, p.path, p.params, p.query, p.fragment))
 
         raw_name = item.get("raw_name", item["name"])
-        self._show_audio_poster(self._is_audio_name(raw_name))
         self._net_paused = False
         self.current = item
         self.current_url = url
@@ -3923,6 +3980,14 @@ class IPTVApp(tk.Tk):
             self.play_external(url)
             self.status_var.set("正在使用外部播放器：%s" % item["name"])
             return
+
+        kind = self._guess_media_kind(raw_name)
+        if kind == "audio":
+            self._show_audio_poster(True)
+        elif kind == "video":
+            self._show_audio_poster(False)
+        else:
+            self._schedule_audio_poster_check()
 
         try:
             media = self.vlc_instance.media_new(url)
@@ -4019,6 +4084,7 @@ class IPTVApp(tk.Tk):
                             % (len(added), first["name"]))
 
     def load_m3u(self, path):
+        self.current_m3u_path = path
         self.webdav_mode = False
         self.webdav_source = None
         self.webdav_path = ""
@@ -4335,24 +4401,21 @@ class IPTVApp(tk.Tk):
         return "file://" + urllib.parse.quote(p, safe="/:")
 
     def _load_audio_poster(self, max_size=200):
-        ico = os.path.join(APP_DIR, "src", "asset", "iptv.ico")
-        if not os.path.isfile(ico):
-            return None
-        try:
-            from PIL import Image, ImageTk
-            img = Image.open(ico).convert("RGBA")
-            img.thumbnail((max_size, max_size), Image.LANCZOS)
-            return ImageTk.PhotoImage(img)
-        except Exception:
-            pass
-        base = os.path.splitext(ico)[0]
-        for ext in (".png", ".gif"):
-            cand = base + ext
-            if os.path.isfile(cand):
-                try:
-                    return tk.PhotoImage(file=cand)
-                except Exception:
-                    pass
+        asset_dir = os.path.join(APP_DIR, "src", "asset")
+
+        for name in ("iptv.png", "iptv.gif"):
+            cand = os.path.join(asset_dir, name)
+            if not os.path.isfile(cand):
+                continue
+            try:
+                img = tk.PhotoImage(file=cand)
+                w, h = img.width(), img.height()
+                if w > max_size or h > max_size:
+                    factor = max(1, (max(w, h) + max_size - 1) // max_size)
+                    img = img.subsample(factor, factor)
+                return img
+            except Exception:
+                continue
         return None
 
     def _show_audio_poster(self, show):
@@ -4377,6 +4440,39 @@ class IPTVApp(tk.Tk):
             except Exception:
                 pass
 
+    def _schedule_audio_poster_check(self):
+        if self._poster_check_id is not None:
+            try:
+                self.after_cancel(self._poster_check_id)
+            except Exception:
+                pass
+            self._poster_check_id = None
+        self._show_audio_poster(False)
+        self._poster_check_tries = 0
+        self._poster_check_id = self.after(600, self._check_audio_poster)
+
+    def _check_audio_poster(self):
+        self._poster_check_id = None
+        if self.player is None or getattr(self, "_closing", False):
+            return
+        if not self.current_url:
+            return
+        try:
+            vtrack = self.player.video_get_track_count()
+        except Exception:
+            vtrack = -1
+
+        if vtrack is None or vtrack < 0:
+            self._poster_check_tries += 1
+            if self._poster_check_tries < 12:
+                self._poster_check_id = self.after(600, self._check_audio_poster)
+            return
+        if vtrack == 0:
+            self._show_audio_poster(True)
+        else:
+            self._show_audio_poster(False)
+
+
     def play_url(self, url, title, live=True):
         self._cancel_seek_status_timer()
         self._net_paused = False
@@ -4384,10 +4480,10 @@ class IPTVApp(tk.Tk):
             self._play_local_file(url, title)
             return
 
-        self._show_audio_poster(self._guess_media_kind(url) == "audio")
         self.current_url = url
         self.current_title = title
         self.current_live = live
+        self._schedule_audio_poster_check()
         if not self.recording:
             try:
                 self.btn_rec.configure(style="TButton")
@@ -4627,6 +4723,14 @@ class IPTVApp(tk.Tk):
 
     def stop(self):
         self._cancel_seek_status_timer()
+
+        if self._poster_check_id is not None:
+            try:
+                self.after_cancel(self._poster_check_id)
+            except Exception:
+                pass
+            self._poster_check_id = None
+
         self._net_paused = False
         if self.player is not None:
             self.player.stop()
@@ -4900,6 +5004,13 @@ class IPTVApp(tk.Tk):
             except Exception:
                 pass
             self._closing_after_id = None
+
+        if self._poster_check_id is not None:
+            try:
+                self.after_cancel(self._poster_check_id)
+            except Exception:
+                pass
+            self._poster_check_id = None
 
         if self._video_click_after_id is not None:
             try:
