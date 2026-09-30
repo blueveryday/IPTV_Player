@@ -25,7 +25,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta, timezone
 
-CODE_VERSION = "IPTV Player v2026.09.29"
+CODE_VERSION = "IPTV Player v2026.09.30"
 
 PY_BITS = struct.calcsize("P") * 8
 SEEK_GRANULARITY = 5
@@ -1005,7 +1005,6 @@ def scan_local_m3u_files():
         entries = sorted(os.listdir(APP_DIR), key=lambda s: s.lower())
     except OSError:
         return files
-    default_norm = os.path.normcase(os.path.abspath(DEFAULT_M3U))
     for name in entries:
         low = name.lower()
         if not (low.endswith(".m3u") or low.endswith(".m3u8")):
@@ -1016,11 +1015,8 @@ def scan_local_m3u_files():
                 continue
         except OSError:
             continue
-        if os.path.normcase(os.path.abspath(p)) == default_norm:
-            continue
         files.append((name, p))
     return files
-
 
 class WebDAVClient:
     def __init__(self, url, user="", password="", timeout=15):
@@ -3768,9 +3764,9 @@ class IPTVApp(tk.Tk):
         m3u_list = scan_local_m3u_files()
         self._webdav_combo_m3u = m3u_list
 
-        names = ["📄 IPTV(本地)"]
+        names = []
         for name, _p in m3u_list:
-            names.append("📺 " + name)
+            names.append(name)
         for s in sources:
             names.append("🌐 " + (s.get("name") or s.get("url") or "?"))
 
@@ -3782,38 +3778,31 @@ class IPTVApp(tk.Tk):
                 idx = names.index("🌐 " + cur)
             except ValueError:
                 idx = 0
-            self.webdav_var.set(names[idx])
+            if names:
+                self.webdav_var.set(names[idx])
             return
 
         cur_path = os.path.normcase(os.path.abspath(self.current_m3u_path)) \
             if self.current_m3u_path else ""
-        if cur_path and cur_path == os.path.normcase(os.path.abspath(DEFAULT_M3U)):
-            self.webdav_var.set(names[0])
-            return
         for i, (_n, p) in enumerate(m3u_list):
             if cur_path and os.path.normcase(os.path.abspath(p)) == cur_path:
-                self.webdav_var.set(names[1 + i])
+                self.webdav_var.set(names[i])
                 return
-        self.webdav_var.set(names[0])
+        if names:
+            self.webdav_var.set(names[0])
+        else:
+            self.webdav_var.set("")
 
     def _on_webdav_combo(self, event=None):
         idx = self.webdav_cb.current()
         if idx < 0:
             return
 
-        if idx == 0:
-            if not os.path.isfile(DEFAULT_M3U):
-                self.status_var.set("未找到 %s，请通过“文件 → 打开 m3u 文件”加载" % DEFAULT_M3U)
-                self._refresh_webdav_combo()
-                return
-            self.load_m3u(DEFAULT_M3U)
-            self.status_var.set("已切换到本地IPTV列表：%s" % DEFAULT_M3U)
-            return
-
         m3u_list = getattr(self, "_webdav_combo_m3u", [])
         m3u_count = len(m3u_list)
-        if idx <= m3u_count:
-            _name, path = m3u_list[idx - 1]
+
+        if idx < m3u_count:
+            _name, path = m3u_list[idx]
             if not os.path.isfile(path):
                 self.status_var.set("文件不存在：%s" % path)
                 self._refresh_webdav_combo()
@@ -3822,7 +3811,7 @@ class IPTVApp(tk.Tk):
             self.status_var.set("已加载：%s" % path)
             return
 
-        src_idx = idx - 1 - m3u_count
+        src_idx = idx - m3u_count
         if src_idx >= len(self._webdav_combo_sources):
             return
         src = self._webdav_combo_sources[src_idx]
