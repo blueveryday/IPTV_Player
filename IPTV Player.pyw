@@ -54,7 +54,7 @@ COLORS = {
     "fg_primary":   "#e0e0e0",
     "fg_secondary": "#9e9e9e",
     "fg_dim":       "#6b6b6b",
-    "disabled_fg":  "#ff5555",
+    "disabled_fg":  "#e0e0e0",
     "accent":       "#4a90d9",
     "accent_dim":   "#3a6fa8",
     "border":       "#3f3f46",
@@ -65,6 +65,7 @@ COLORS = {
     "status_bg":    "#2d2d30",
     "live_green":   "#5ecb6b",
     "rec_red":      "#ff3b30",
+    "epg_future":   "#ff5555",
 }
 
 MENU_CHECK_FG = "#ffffff"
@@ -275,12 +276,27 @@ def describe_vlc_problem(err):
                 "无需卸载：可以下载 %d 位的免安装组件放在程序目录里使用。" % (bits, PY_BITS, PY_BITS)) + detail
     return "找到了 VLC（%s），但加载失败，请尝试重新安装 VLC。" % VLC_MATCH_DIR + detail
 
+def _long_path(path):
+    if not path or not sys.platform.startswith("win"):
+        return path
+    try:
+        import ctypes
+        GetLongPathNameW = ctypes.windll.kernel32.GetLongPathNameW
+        GetLongPathNameW.argtypes = [ctypes.c_wchar_p,
+                                     ctypes.c_wchar_p, ctypes.c_uint]
+        GetLongPathNameW.restype = ctypes.c_uint
+        buf = ctypes.create_unicode_buffer(32768)
+        n = GetLongPathNameW(path, buf, len(buf))
+        if n and n < len(buf):
+            return buf.value
+    except Exception:
+        pass
+    return path
 
 def app_dir():
     if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
-
+        return _long_path(os.path.dirname(sys.executable))
+    return _long_path(os.path.dirname(os.path.abspath(__file__)))
 
 APP_DIR = app_dir()
 DEFAULT_M3U = os.path.join(APP_DIR, "iptv.m3u")
@@ -319,6 +335,125 @@ def find_ffprobe(ffmpeg_path=None):
         if os.path.isfile(c):
             return c
     return shutil.which("ffprobe")
+
+
+def _png_to_dib_bytes(png_path):
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        return None, "未找到 ffmpeg（PNG 转 DIB 需要它）"
+    tmp_bmp = png_path + ".clip.bmp"
+    kw = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE,
+          "stdin": subprocess.DEVNULL}
+    if sys.platform.startswith("win"):
+        kw["creationflags"] = 0x08000000
+    try:
+        r = subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error", "-i", png_path,
+             "-frames:v", "1",
+             "-f", "image2", "-vcodec", "bmp",
+             "-pix_fmt", "bgr24", tmp_bmp],
+            timeout=30, **kw)
+    except Exception as e:
+        return None, "ffmpeg 调用异常：%s" % e
+
+    if r.returncode != 0:
+        err = ""
+        try:
+            err = (r.stderr or b"").decode("utf-8", "replace").strip()[:300]
+        except Exception:
+            pass
+        try:
+            os.remove(tmp_bmp)
+        except OSError:
+            pass
+        return None, "ffmpeg 转换失败(rc=%d)：%s" % (r.returncode, err or "无输出")
+
+    try:
+        with open(tmp_bmp, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        return None, "读取 BMP 失败：%s" % e
+    finally:
+        try:
+            os.remove(tmp_bmp)
+        except OSError:
+            pass
+
+    if len(raw) < 14:
+        return None, "BMP 文件过短（%d 字节）" % len(raw)
+    if raw[:2] != b"BM":
+        return None, "BMP 头无效（magic=%r）" % raw[:2]
+    return raw[14:], None
+
+
+def copy_image_file_to_clipboard(png_path):
+    if not sys.platform.startswith("win"):
+        return False, "仅支持 Windows"
+    try:
+        import ctypes
+    except Exception as e:
+        return False, "无法加载 ctypes：%s" % e
+
+    dib, err = _png_to_dib_bytes(png_path)
+    if not dib:
+        return False, err or "PNG 转 DIB 失败"
+
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+    except Exception as e:
+        return False, "加载 Windows API 失败：%s" % e
+
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.restype = ctypes.c_void_p
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_int
+    user32.EmptyClipboard.restype = ctypes.c_int
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.CloseClipboard.restype = ctypes.c_int
+
+    GMEM_MOVEABLE = 0x0002
+    CF_DIB = 8
+
+    h_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(dib))
+    if not h_mem:
+        return False, "GlobalAlloc(%d) 失败" % len(dib)
+
+    ptr = kernel32.GlobalLock(h_mem)
+    if not ptr:
+        kernel32.GlobalFree(h_mem)
+        return False, "GlobalLock 失败"
+    try:
+        ctypes.memmove(ptr, dib, len(dib))
+    finally:
+        kernel32.GlobalUnlock(h_mem)
+
+    opened = False
+    for _ in range(10):
+        if user32.OpenClipboard(None):
+            opened = True
+            break
+        time.sleep(0.05)
+    if not opened:
+        kernel32.GlobalFree(h_mem)
+        return False, "无法打开剪贴板（可能被其它程序占用）"
+
+    try:
+        if not user32.EmptyClipboard():
+            kernel32.GlobalFree(h_mem)
+            return False, "EmptyClipboard 失败"
+        if not user32.SetClipboardData(CF_DIB, h_mem):
+            kernel32.GlobalFree(h_mem)
+            return False, "SetClipboardData(CF_DIB) 失败"
+    finally:
+        user32.CloseClipboard()
+    return True, None
 
 
 def safe_filename(name, maxlen=80):
@@ -427,6 +562,25 @@ def _probe_stream_codecs(ffprobe, url, use_tcp=True, timeout=10):
             a_codec = name
     return v_codec, a_codec
 
+def _ffprobe_full_info(ffprobe, url, use_tcp=True, timeout=15):
+    if not ffprobe:
+        return None
+    cmd = [ffprobe, "-v", "quiet", "-print_format", "json",
+           "-show_streams", "-show_format",
+           "-analyzeduration", "3000000",
+           "-probesize", "3000000"]
+    if use_tcp and str(url).lower().startswith("rtsp://"):
+        cmd += ["-rtsp_transport", "tcp",
+                "-rtsp_flags", "prefer_tcp",
+                "-rw_timeout", "10000000"]
+    cmd += ["-i", url]
+    stdout = _ffprobe_run(cmd, timeout)
+    if not stdout:
+        return None
+    try:
+        return json.loads(stdout.decode("utf-8", "replace"))
+    except Exception:
+        return None
 
 def _sniff_is_hls(url, timeout=3):
     if not url or not url.lower().startswith(("http://", "https://")):
@@ -913,6 +1067,20 @@ class PanelToggle(tk.Canvas):
         self.create_line(cx + gap, cy - half, cx + gap, cy + half,
                          fill=color, width=2)
 
+class StatusVar(tk.StringVar):
+    def __init__(self, app, **kw):
+        super().__init__(app, **kw)
+        self._app = app
+        self._mute = False
+
+    def set(self, value):
+        super().set(value)
+        if self._mute:
+            return
+        try:
+            self._app._on_status_set()
+        except Exception:
+            pass
 
 def read_text_auto(path):
     raw = open(path, "rb").read()
@@ -1495,9 +1663,10 @@ class IPTVApp(tk.Tk):
         super().__init__()
         self.title(CODE_VERSION)
         apply_app_icon(self)
-        self.geometry("1280x800")
+        self.geometry("960x590")
         self.minsize(960, 590)
         self.configure(bg=COLORS["bg_root"])
+        center_window(self)
 
         self.cfg = dict(DEFAULT_CONFIG)
         self.load_config()
@@ -1560,8 +1729,13 @@ class IPTVApp(tk.Tk):
         self.audio_poster = None
         self._poster_check_id = None
         self._poster_check_tries = 0
+
+        # 数字键遥控输入
         self._num_buffer = ""
         self._num_after_id = None
+
+        # 截图
+        self._snapshot_pending = []
 
         self._setup_ttk_style()
         self.build_menu()
@@ -1757,14 +1931,14 @@ class IPTVApp(tk.Tk):
             bd=0, relief="flat")
 
         m = tk.Menu(
-            menubar, tearoff=0,
-            bg=COLORS["bg_panel"],
-            fg=COLORS["fg_primary"],
-            disabledforeground=COLORS["disabled_fg"],
+            self, tearoff=0,
+            bg=COLORS["bg_panel"], fg=COLORS["fg_primary"],
+            disabledforeground="#ffffff",        # 白色
             activebackground=COLORS["accent_dim"],
             activeforeground=MENU_CHECK_ACTIVE_FG,
             selectcolor=MENU_CHECK_FG)
-        m.add_command(label="打开 m3u 文件...", command=self.open_m3u)
+
+        m.add_command(label="打开 M3U 文件...", command=self.open_m3u)
         m.add_command(label="打开本地文件...", command=self.open_media_file)
         m.add_command(label="浏览 WebDAV...", command=self.open_webdav_dialog)
         m.add_command(label="重新加载", command=self.load_default)
@@ -1773,34 +1947,6 @@ class IPTVApp(tk.Tk):
         m.add_separator()
         m.add_command(label="退出", command=self.on_close)
         menubar.add_cascade(label="文件", menu=m)
-
-        pm = tk.Menu(
-            menubar, tearoff=0,
-            bg=COLORS["bg_panel"],
-            fg=COLORS["fg_primary"],
-            disabledforeground=COLORS["disabled_fg"],
-            activebackground=COLORS["accent_dim"],
-            activeforeground=MENU_CHECK_ACTIVE_FG,
-            selectcolor=MENU_CHECK_FG)
-        self.hw_var = tk.BooleanVar(value=bool(self.cfg.get("hw_decode", True)))
-        self.tcp_var = tk.BooleanVar(value=bool(self.cfg.get("rtsp_tcp", True)))
-        pm.add_checkbutton(label="硬件解码", variable=self.hw_var,
-                           command=self.on_decode_option_changed)
-        pm.add_checkbutton(label="RTSP 使用 TCP（仅对 rtsp:// 生效）", variable=self.tcp_var,
-                           command=self.on_decode_option_changed)
-        menubar.add_cascade(label="播放选项", menu=pm)
-
-        em = tk.Menu(
-            menubar, tearoff=0,
-            bg=COLORS["bg_panel"],
-            fg=COLORS["fg_primary"],
-            disabledforeground=COLORS["disabled_fg"],
-            activebackground=COLORS["accent_dim"],
-            activeforeground=MENU_CHECK_ACTIVE_FG,
-            selectcolor=MENU_CHECK_FG)
-        em.add_command(label="下载 EPG", command=self.manual_epg_update)
-        em.add_command(label="自定义 EPG 下载参数...", command=self.open_epg_settings)
-        menubar.add_cascade(label="EPG选项", menu=em)
 
         rm = tk.Menu(
             menubar, tearoff=0,
@@ -1822,6 +1968,28 @@ class IPTVApp(tk.Tk):
         rm.add_separator()
         rm.add_command(label="打开录制目录", command=self.open_record_dir)
         menubar.add_cascade(label="录制", menu=rm)
+
+        em = tk.Menu(
+            menubar, tearoff=0,
+            bg=COLORS["bg_panel"],
+            fg=COLORS["fg_primary"],
+            disabledforeground=COLORS["disabled_fg"],
+            activebackground=COLORS["accent_dim"],
+            activeforeground=MENU_CHECK_ACTIVE_FG,
+            selectcolor=MENU_CHECK_FG)
+        self.hw_var = tk.BooleanVar(value=bool(self.cfg.get("hw_decode", True)))
+        self.tcp_var = tk.BooleanVar(value=bool(self.cfg.get("rtsp_tcp", True)))
+        em.add_checkbutton(label="硬件解码", variable=self.hw_var,
+                           command=self.on_decode_option_changed)
+        em.add_checkbutton(label="RTSP 使用 TCP（仅对 rtsp:// 生效）",
+                           variable=self.tcp_var,
+                           command=self.on_decode_option_changed)
+        em.add_separator()
+        em.add_command(label="下载 EPG", command=self.manual_epg_update)
+        em.add_command(label="自定义 EPG 下载参数...", command=self.open_epg_settings)
+        em.add_separator()
+        em.add_command(label="打开截图目录", command=self.open_screenshot_dir)
+        menubar.add_cascade(label="选项", menu=em)
 
         menubar.add_command(label="关于", command=self.show_about)
 
@@ -1872,6 +2040,27 @@ class IPTVApp(tk.Tk):
         bf = ttk.Frame(win, style="Panel.TFrame")
         bf.pack(pady=(4, 14))
         ttk.Button(bf, text="关闭", command=win.destroy).pack(side=tk.LEFT, padx=6)
+
+        win.grab_set()
+        center_window(win, self)
+
+    def _show_info(self, msg, title="提示", parent=None):
+        win = tk.Toplevel(parent or self)
+        win.title(title)
+        win.configure(bg=COLORS["bg_panel"])
+        win.transient(parent or self)
+        win.resizable(False, False)
+
+        ttk.Label(win, text=msg,
+                  background=COLORS["bg_panel"],
+                  foreground="#ffffff",          # 纯白
+                  font=("Microsoft YaHei UI", 10),
+                  wraplength=380, justify=tk.LEFT).pack(
+            padx=24, pady=(20, 12))
+
+        bf = ttk.Frame(win, style="Panel.TFrame")
+        bf.pack(pady=(0, 16))
+        ttk.Button(bf, text="确定", command=win.destroy).pack()
 
         win.grab_set()
         center_window(win, self)
@@ -2017,7 +2206,7 @@ class IPTVApp(tk.Tk):
         self.vol_pct_label.bind("<Double-Button-1>",
                                 lambda e: (self.vol_var.set(100), self.on_volume()))
 
-        self.status_var = tk.StringVar(value="就绪")
+        self.status_var = StatusVar(self, value="就绪")
         self.status_bar = ttk.Frame(mid, style="Status.TFrame")
         self.status_bar.grid(row=3, column=0, sticky="ew", padx=4, pady=(3, 4))
         self.status_bar.grid_columnconfigure(0, weight=1)
@@ -2121,6 +2310,7 @@ class IPTVApp(tk.Tk):
 
         self.bind("<F2>", lambda e: self.toggle_left())
         self.bind("<F3>", lambda e: self.toggle_right())
+        self.bind("<F4>", self._on_snapshot_key)
         self.bind("<Escape>", self.on_escape)
 
         self.bind("<space>", self._on_space_key)
@@ -2652,6 +2842,23 @@ class IPTVApp(tk.Tk):
         except Exception as e:
             messagebox.showerror("错误", "无法打开录制目录：%s\n%s" % (RECORD_DIR, e))
 
+    def open_screenshot_dir(self):
+        snap_dir = os.path.join(APP_DIR, "screenshot")
+        try:
+            os.makedirs(snap_dir, exist_ok=True)
+        except Exception as e:
+            messagebox.showerror("错误", "无法创建截图目录：%s" % e)
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(snap_dir)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", snap_dir])
+            else:
+                subprocess.Popen(["xdg-open", snap_dir])
+        except Exception as e:
+            messagebox.showerror("错误", "无法打开截图目录：%s\n%s" % (snap_dir, e))
+
     def _on_channel_click(self, event=None):
         try:
             idx = self.ch_list.nearest(event.y)
@@ -3038,8 +3245,6 @@ class IPTVApp(tk.Tk):
         return replay_supported(ch["url"], self.cfg)
 
     def _on_video_right_click(self, event):
-        if self.webdav_mode:
-            return
         ch = self.selected_channel() or self.current
         m = tk.Menu(
             self, tearoff=0,
@@ -3048,6 +3253,22 @@ class IPTVApp(tk.Tk):
             activebackground=COLORS["accent_dim"],
             activeforeground=MENU_CHECK_ACTIVE_FG,
             selectcolor=MENU_CHECK_FG)
+
+        if self.webdav_mode:
+            if not ch:
+                m.add_command(label="（请先在左侧选择项目）", state="disabled")
+            elif ch.get("is_dir"):
+                m.add_command(label="📁 打开目录", command=self.play_live)
+            else:
+                m.add_command(label="▶ 播放  %s" % ch["name"],
+                              command=self.play_live)
+            m.add_separator()
+            m.add_command(label="⏹ 停止", command=self.stop)
+            try:
+                m.tk_popup(event.x_root, event.y_root)
+            finally:
+                m.grab_release()
+            return
 
         if not ch:
             m.add_command(label="（请先在左侧选择频道）", state="disabled")
@@ -3097,9 +3318,9 @@ class IPTVApp(tk.Tk):
                     if start >= now or d < earliest:
                         day_menu.add_command(
                             label=label,
-                            foreground=COLORS["disabled_fg"],
+                            foreground=COLORS["epg_future"],
                             activebackground=COLORS["bg_panel"],
-                            activeforeground=COLORS["disabled_fg"],
+                            activeforeground=COLORS["epg_future"],
                             command=lambda: None)
                     else:
                         day_menu.add_command(
@@ -3112,10 +3333,305 @@ class IPTVApp(tk.Tk):
         m.add_separator()
         m.add_command(label="⏹ 停止", command=self.stop)
 
+        m.add_separator()
+        has_media = bool(self.current_url)
+        if has_media:
+            m.add_command(label="📷 截图画面 (F4)",
+                          command=self.take_snapshot)
+            m.add_command(label="🔍 查看流编码信息",
+                          command=self.show_stream_info)
+
         try:
             m.tk_popup(event.x_root, event.y_root)
         finally:
             m.grab_release()
+
+    def _on_snapshot_key(self, event=None):
+        if self._focus_is_text_input():
+            return None
+        self.take_snapshot()
+        return "break"
+
+    def take_snapshot(self):
+        if self.player is None:
+            self.status_var.set("当前使用外部播放器，无法在程序内截图")
+            return
+        if not self.current_url:
+            self.status_var.set("没有正在播放的内容，无法截图")
+            return
+
+        try:
+            vtrack = self.player.video_get_track_count()
+        except Exception:
+            vtrack = -1
+        if vtrack == 0:
+            self.status_var.set("当前是纯音频，无画面可截图")
+            return
+
+        snap_dir = os.path.join(APP_DIR, "screenshot")
+        try:
+            os.makedirs(snap_dir, exist_ok=True)
+            t = os.path.join(snap_dir, ".w")
+            open(t, "w").close()
+            os.remove(t)
+        except OSError as e:
+            messagebox.showerror("截图失败", "无法写入截图目录：\n%s\n%s"
+                                 % (snap_dir, e))
+            return
+
+        raw = self.current_title or "snapshot"
+        raw = re.sub(r'^\s*(?:\[[^\]]*\]|📁|🎵|🎬|📄|🌐|⬅|▶|⏹|●)\s*', "",
+                     raw)
+        base = safe_filename(raw) or "snapshot"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(snap_dir, "%s_%s.png" % (base, ts))
+        n = 1
+        while os.path.exists(path):
+            path = os.path.join(snap_dir, "%s_%s_%d.png" % (base, ts, n))
+            n += 1
+
+        try:
+            ret = self.player.video_take_snapshot(0, path, 0, 0)
+        except Exception as e:
+            messagebox.showerror("截图失败", "调用截图接口出错：%s" % e)
+            return
+        if ret == -1:
+            self.status_var.set("截图失败：VLC 拒绝截图（可能是纯音频或画面尚未就绪）")
+            return
+
+        self.status_var.set("正在保存截图…")
+        self.after(600, lambda p=path: self._check_snapshot(p))
+
+    def _check_snapshot(self, path, tries=0):
+        if getattr(self, "_closing", False):
+            return
+
+        exists = False
+        try:
+            exists = os.path.isfile(path) and os.path.getsize(path) > 0
+        except OSError:
+            exists = False
+
+        if not exists:
+            if tries < 20:
+                self.after(150, lambda p=path, t=tries + 1:
+                           self._check_snapshot(p, t))
+                return
+            self.status_var.set("截图未生成（画面可能尚未渲染完成，稍后重试）")
+            return
+
+        size_kb = os.path.getsize(path) / 1024.0
+        copied = False
+        err = None
+        try:
+            copied, err = copy_image_file_to_clipboard(path)
+        except Exception as e:
+            err = str(e)
+
+        if copied:
+            self.status_var.set(
+                "截图已保存并复制到剪贴板：%s（%.0f KB）" % (path, size_kb))
+        else:
+            self.status_var.set(
+                "截图已保存：%s（%.0f KB）｜剪贴板失败：%s"
+                % (path, size_kb, err or "未知原因"))
+
+    def show_stream_info(self):
+        url = self.current_url
+        if not url:
+            messagebox.showinfo("提示", "没有正在播放的内容")
+            return
+        ffprobe = find_ffprobe(find_ffmpeg())
+        if not ffprobe:
+            messagebox.showerror(
+                "缺少 ffprobe",
+                "未找到 ffprobe，无法分析流编码信息。\n\n"
+                "请安装 ffmpeg 并加入 PATH，或把 ffprobe.exe 放在程序目录下，"
+                "例如：\n%s" % os.path.join(APP_DIR, "ffprobe.exe"))
+            return
+
+        self.status_var.set("正在分析流编码信息…")
+        tcp = bool(self.cfg.get("rtsp_tcp", True))
+
+        def worker():
+            data = _ffprobe_full_info(ffprobe, url, tcp, timeout=15)
+            try:
+                self.after(0, lambda: self._show_stream_info_dialog(url, data))
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_stream_info_dialog(self, url, data):
+        if getattr(self, "_closing", False):
+            return
+        if data is None:
+            self.status_var.set("无法获取流编码信息")
+            messagebox.showerror(
+                "获取失败",
+                "ffprobe 无法读取该流的编码信息。\n\n"
+                "可能原因：\n"
+                "• 地址需要鉴权（回看地址请先播放再查看）\n"
+                "• 流被限制并发连接\n"
+                "• 网络超时或该源不响应分析")
+            return
+
+        self.status_var.set("流编码信息已获取")
+
+        win = tk.Toplevel(self)
+        win.title("流编码信息")
+        win.configure(bg=COLORS["bg_panel"])
+        win.transient(self)
+        win.geometry("680x425")
+
+        top = ttk.Frame(win, style="Panel.TFrame")
+        top.pack(fill=tk.X, padx=10, pady=(10, 4))
+        ttk.Label(top, text="地址：", style="Dim.TLabel").pack(side=tk.LEFT)
+        tk.Label(top, text=url, anchor="w", justify=tk.LEFT,
+                 bg=COLORS["bg_panel"], fg=COLORS["accent"],
+                 wraplength=660).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        body = ttk.Frame(win, style="Panel.TFrame")
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        sb = ttk.Scrollbar(body, orient=tk.VERTICAL)
+        txt = tk.Text(body, wrap=tk.WORD, yscrollcommand=sb.set,
+                      bg=COLORS["bg_input"], fg=COLORS["fg_primary"],
+                      insertbackground=COLORS["fg_primary"],
+                      highlightthickness=0, bd=0, relief="flat",
+                      font=("Consolas", 9))
+        sb.config(command=txt.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        txt.insert("1.0", self._format_stream_info(data))
+        txt.configure(state="disabled")
+
+        bf = ttk.Frame(win, style="Panel.TFrame")
+        bf.pack(pady=(4, 10))
+        ttk.Button(bf, text="复制全部",
+                   command=lambda: self._copy_stream_info(txt)).pack(
+            side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="关闭", command=win.destroy).pack(
+            side=tk.LEFT, padx=6)
+
+        win.grab_set()
+        center_window(win, self)
+
+    def _copy_stream_info(self, txt):
+        try:
+            content = txt.get("1.0", tk.END).rstrip()
+            self.clipboard_clear()
+            self.clipboard_append(content)
+            self.status_var.set("流编码信息已复制到剪贴板")
+        except Exception as e:
+            messagebox.showerror("错误", "复制失败：%s" % e)
+
+    @staticmethod
+    def _fmt_bitrate(bps):
+        try:
+            bps = int(bps)
+        except Exception:
+            return "?"
+        if bps >= 1000000:
+            return "%.3f Mb/s" % (bps / 1000000.0)
+        return "%.1f kb/s" % (bps / 1000.0)
+
+    @staticmethod
+    def _fmt_duration(sec):
+        try:
+            sec = int(float(sec))
+        except Exception:
+            return "?"
+        h, r = divmod(sec, 3600)
+        m, s = divmod(r, 60)
+        return "%02d:%02d:%02d" % (h, m, s)
+
+    def _format_stream_info(self, data):
+        lines = []
+        fmt = data.get("format") or {}
+        streams = data.get("streams") or []
+
+        lines.append("=== 容器 / 格式 ===")
+        if fmt.get("format_long_name"):
+            lines.append("格式名   : %s" % fmt["format_long_name"])
+        if fmt.get("format_name"):
+            lines.append("短名     : %s" % fmt["format_name"])
+        if fmt.get("duration"):
+            lines.append("时长     : %s" % self._fmt_duration(fmt["duration"]))
+        if fmt.get("bit_rate"):
+            lines.append("总码率   : %s" % self._fmt_bitrate(fmt["bit_rate"]))
+        if fmt.get("size"):
+            try:
+                lines.append("大小     : %.2f MB"
+                             % (int(fmt["size"]) / 1048576.0))
+            except Exception:
+                pass
+        if fmt.get("nb_streams"):
+            lines.append("流数量   : %s" % fmt["nb_streams"])
+        lines.append("")
+
+        v_idx = a_idx = 0
+        for st in streams:
+            ct = st.get("codec_type")
+            if ct == "video":
+                v_idx += 1
+                lines.append("=== 视频流 #%d（索引 %s） ==="
+                             % (v_idx, st.get("index")))
+            elif ct == "audio":
+                a_idx += 1
+                lines.append("=== 音频流 #%d（索引 %s） ==="
+                             % (a_idx, st.get("index")))
+            else:
+                lines.append("=== %s 流（索引 %s） ==="
+                             % (ct or "?", st.get("index")))
+
+            codec = st.get("codec_name") or "未知"
+            profile = st.get("profile")
+            if profile:
+                codec += " (%s)" % profile
+            lines.append("编码     : %s" % codec)
+
+            if ct == "video":
+                if st.get("width") and st.get("height"):
+                    lines.append("分辨率   : %sx%s"
+                                 % (st["width"], st["height"]))
+                if st.get("pix_fmt"):
+                    lines.append("像素格式 : %s" % st["pix_fmt"])
+                fr = st.get("avg_frame_rate") or st.get("r_frame_rate")
+                if fr and fr != "0/0":
+                    try:
+                        n, d = fr.split("/")
+                        lines.append("帧率     : %.3f fps"
+                                     % (float(n) / float(d)))
+                    except Exception:
+                        lines.append("帧率     : %s" % fr)
+                if st.get("color_space"):
+                    lines.append("色彩空间 : %s" % st["color_space"])
+                if st.get("color_range"):
+                    lines.append("色彩范围 : %s" % st["color_range"])
+                if st.get("level") is not None:
+                    lines.append("级别     : %s" % st["level"])
+                if st.get("field_order") and st["field_order"] != "progressive":
+                    lines.append("场序     : %s" % st["field_order"])
+            elif ct == "audio":
+                if st.get("sample_rate"):
+                    lines.append("采样率   : %s Hz" % st["sample_rate"])
+                if st.get("channels") is not None:
+                    lines.append("声道数   : %s" % st["channels"])
+                if st.get("channel_layout"):
+                    lines.append("声道布局 : %s" % st["channel_layout"])
+                if st.get("sample_fmt"):
+                    lines.append("采样格式 : %s" % st["sample_fmt"])
+
+            if st.get("bit_rate"):
+                lines.append("码率     : %s" % self._fmt_bitrate(st["bit_rate"]))
+            if st.get("tags", {}).get("language"):
+                lines.append("语言     : %s" % st["tags"]["language"])
+            if st.get("disposition", {}).get("default"):
+                lines.append("默认轨   : 是")
+            lines.append("")
+
+        return "\n".join(lines).rstrip() + "\n"
 
     def _clear_replay_range(self):
         self.replay_range_start = None
@@ -3176,27 +3692,51 @@ class IPTVApp(tk.Tk):
             self._seek_status_after_id = None
 
     def _flash_seek_status(self, text):
-        self._cancel_seek_status_timer()
         self.status_var.set(text)
         self._seek_status_after_id = self.after(5000, self._restore_play_status)
+
+    STATUS_RESTORE_DELAY_MS = 5000
+
+    def _on_status_set(self):
+        if getattr(self, "_closing", False):
+            return
+        if self._seek_status_after_id is not None:
+            try:
+                self.after_cancel(self._seek_status_after_id)
+            except Exception:
+                pass
+        self._seek_status_after_id = self.after(
+            self.STATUS_RESTORE_DELAY_MS, self._on_status_restore_fired)
+
+    def _on_status_restore_fired(self):
+        self._seek_status_after_id = None
+        self._restore_play_status()
 
     def _restore_play_status(self):
         self._seek_status_after_id = None
         if getattr(self, "_closing", False):
             return
-        if self.recording:
-            if self.rec_path:
-                label = "录像" if self.rec_mode == "video" else "录音"
-                self.status_var.set("正在%s：%s" % (
-                    label, os.path.basename(self.rec_path)))
+
+        text = None
+        if self.recording and self.rec_path:
+            label = "录像" if self.rec_mode == "video" else "录音"
+            text = "正在%s：%s" % (label, os.path.basename(self.rec_path))
+        elif self.current_url:
+            if self._is_file_playback():
+                text = "正在播放：%s  %s" % (self.current_title, self.current_url)
+            else:
+                text = "正在播放：%s" % self.current_title
+
+        if text is None:
             return
-        if not self.current_url:
+        if self.status_var.get() == text:
             return
-        if self._is_file_playback():
-            self.status_var.set("正在播放：%s  %s" % (
-                self.current_title, self.current_url))
-        else:
-            self.status_var.set("正在播放：%s" % self.current_title)
+
+        self.status_var._mute = True
+        try:
+            self.status_var.set(text)
+        finally:
+            self.status_var._mute = False
 
     def _seek_local_media(self, value, phase):
         if self.player is None:
@@ -3684,8 +4224,10 @@ class IPTVApp(tk.Tk):
             self.slot_list.insert(tk.END, "  " + label)
             self.slot_items.append((s, e))
             is_current = (s <= now < e)
-            if self._slots_locked or s >= now:
-                self.slot_list.itemconfig(i, fg=COLORS["disabled_fg"])
+            if self._slots_locked:
+                self.slot_list.itemconfig(i, fg=COLORS["fg_dim"])
+            elif s >= now:
+                self.slot_list.itemconfig(i, fg=COLORS["epg_future"])
             elif is_current:
                 self.slot_list.itemconfig(i, fg=COLORS["live_green"])
             if cur_idx is None and is_current:
@@ -4661,7 +5203,7 @@ class IPTVApp(tk.Tk):
     def play_live(self):
         ch = self.selected_channel()
         if not ch:
-            messagebox.showinfo("提示", "请先选择频道")
+            self._show_info("请先选择频道")
             return
 
         self._stop_recording_for_switch()
