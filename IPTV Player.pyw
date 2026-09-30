@@ -11,6 +11,7 @@ import importlib
 import site
 import struct
 import threading
+import tempfile
 import hashlib
 import zipfile
 import urllib.request
@@ -41,6 +42,15 @@ AUDIO_EXTS = {
     ".mp3", ".aac", ".flac", ".wav", ".ape", ".ogg", ".wma", ".m4a", ".opus",
     ".ac3", ".dts", ".aiff", ".aif", ".alac", ".mka", ".mp2", ".mpc", ".wv",
 }
+
+SUB_EXTS = {
+    ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".smi", ".sami", ".rt",
+    ".txt", ".aqt", ".jss", ".js", ".utf", ".utf8", ".utf-8", ".sup",
+    ".mks", ".cdg",
+}
+SUB_EXTS_AUTO = SUB_EXTS - {".txt", ".js"}
+SUB_TEXT_EXTS = {".srt", ".ass", ".ssa", ".vtt", ".sub", ".smi", ".sami",
+                 ".rt", ".txt", ".aqt", ".jss", ".js"}
 
 WEEKDAY_CN = "一二三四五六日"
 
@@ -938,6 +948,7 @@ DEFAULT_CONFIG = {
     "epg_timeout": 10,
     "webdav_sources": [],
     "record_stop_on_switch": True,
+    "sub_auto_load": True,
 }
 
 
@@ -1115,6 +1126,65 @@ def is_local_media_file(url):
     except Exception:
         return False
     return os.path.splitext(path)[1].lower() in MEDIA_EXTS
+
+
+def find_sibling_subs(media_path):
+    d = os.path.dirname(os.path.abspath(media_path))
+    base = os.path.splitext(os.path.basename(media_path))[0].lower()
+    try:
+        names = sorted(os.listdir(d), key=lambda s: s.lower())
+    except OSError:
+        return []
+    lower_names = {n.lower() for n in names}
+    result = []
+    for n in names:
+        stem, ext = os.path.splitext(n)
+        if ext.lower() not in SUB_EXTS_AUTO:
+            continue
+        sl = stem.lower()
+        if not (sl == base or sl.startswith(base + ".")):
+            continue
+        if ext.lower() == ".sub" and (stem + ".idx").lower() in lower_names:
+            continue
+        p = os.path.join(d, n)
+        if os.path.isfile(p):
+            result.append(p)
+    return result
+
+
+def prepare_sub_file(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in SUB_TEXT_EXTS:
+        return path
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(16 * 1024 * 1024)
+    except OSError:
+        return path
+    if raw[:3] == b"\xef\xbb\xbf" or raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return path
+    if b"\x00" in raw[:4096]:
+        return path
+    try:
+        raw.decode("utf-8")
+        return path
+    except UnicodeDecodeError:
+        pass
+    try:
+        text = raw.decode("gb18030", errors="replace")
+        cache = os.path.join(tempfile.gettempdir(), "IPTVPlayer_sub")
+        os.makedirs(cache, exist_ok=True)
+        try:
+            mt = int(os.path.getmtime(path))
+        except OSError:
+            mt = 0
+        key = hashlib.md5(("%s|%d" % (os.path.abspath(path), mt)).encode("utf-8")).hexdigest()
+        out = os.path.join(cache, key + ext)
+        with open(out, "w", encoding="utf-8-sig", newline="") as f:
+            f.write(text)
+        return out
+    except Exception:
+        return path
 
 
 def fmt_ms(ms):
@@ -1730,11 +1800,9 @@ class IPTVApp(tk.Tk):
         self._poster_check_id = None
         self._poster_check_tries = 0
 
-        # 数字键遥控输入
         self._num_buffer = ""
         self._num_after_id = None
 
-        # 截图
         self._snapshot_pending = []
 
         self._setup_ttk_style()
@@ -1933,7 +2001,7 @@ class IPTVApp(tk.Tk):
         m = tk.Menu(
             self, tearoff=0,
             bg=COLORS["bg_panel"], fg=COLORS["fg_primary"],
-            disabledforeground="#ffffff",        # 白色
+            disabledforeground="#ffffff",
             activebackground=COLORS["accent_dim"],
             activeforeground=MENU_CHECK_ACTIVE_FG,
             selectcolor=MENU_CHECK_FG)
@@ -1990,6 +2058,40 @@ class IPTVApp(tk.Tk):
         em.add_separator()
         em.add_command(label="打开截图目录", command=self.open_screenshot_dir)
         menubar.add_cascade(label="选项", menu=em)
+
+        sm = tk.Menu(
+            menubar, tearoff=0,
+            bg=COLORS["bg_panel"], fg=COLORS["fg_primary"],
+            disabledforeground=COLORS["disabled_fg"],
+            activebackground=COLORS["accent_dim"],
+            activeforeground=MENU_CHECK_ACTIVE_FG,
+            selectcolor=MENU_CHECK_FG)
+        sm.add_command(label="加载外挂字幕... (F5)", command=self.load_subtitle_dialog)
+        sm.add_command(label="关闭字幕", command=self.disable_subtitle)
+        sm.add_separator()
+        self.sub_auto_var = tk.BooleanVar(
+            value=bool(self.cfg.get("sub_auto_load", True)))
+        sm.add_checkbutton(label="播放本地文件时自动加载同名字幕",
+                           variable=self.sub_auto_var,
+                           command=self.on_sub_auto_changed)
+        sm.add_separator()
+        sm.add_command(label="字幕延迟 -0.5 秒",
+                       command=lambda: self.adjust_sub_delay(-500))
+        sm.add_command(label="字幕延迟 +0.5 秒",
+                       command=lambda: self.adjust_sub_delay(500))
+        sm.add_command(label="重置字幕延迟",
+                       command=lambda: self.adjust_sub_delay(0, reset=True))
+        sm.add_separator()
+        self.sub_track_menu = tk.Menu(
+            sm, tearoff=0,
+            bg=COLORS["bg_panel"], fg=COLORS["fg_primary"],
+            disabledforeground=COLORS["disabled_fg"],
+            activebackground=COLORS["accent_dim"],
+            activeforeground=MENU_CHECK_ACTIVE_FG,
+            selectcolor=MENU_CHECK_FG,
+            postcommand=self._rebuild_sub_track_menu)
+        sm.add_cascade(label="字幕轨道", menu=self.sub_track_menu)
+        menubar.add_cascade(label="字幕", menu=sm)
 
         menubar.add_command(label="关于", command=self.show_about)
 
@@ -2053,7 +2155,7 @@ class IPTVApp(tk.Tk):
 
         ttk.Label(win, text=msg,
                   background=COLORS["bg_panel"],
-                  foreground="#ffffff",          # 纯白
+                  foreground="#ffffff",
                   font=("Microsoft YaHei UI", 10),
                   wraplength=380, justify=tk.LEFT).pack(
             padx=24, pady=(20, 12))
@@ -2311,6 +2413,7 @@ class IPTVApp(tk.Tk):
         self.bind("<F2>", lambda e: self.toggle_left())
         self.bind("<F3>", lambda e: self.toggle_right())
         self.bind("<F4>", self._on_snapshot_key)
+        self.bind("<F5>", lambda e: self.load_subtitle_dialog())
         self.bind("<Escape>", self.on_escape)
 
         self.bind("<space>", self._on_space_key)
@@ -3117,7 +3220,6 @@ class IPTVApp(tk.Tk):
             self.play_live()
         return "break"
 
-    # ---------- 数字键遥控输入 ----------
     NUM_INPUT_TIMEOUT_MS = 1500
 
     def _on_list_return(self, event=None):
@@ -3351,6 +3453,134 @@ class IPTVApp(tk.Tk):
             return None
         self.take_snapshot()
         return "break"
+
+    def on_sub_auto_changed(self):
+        self.cfg["sub_auto_load"] = bool(self.sub_auto_var.get())
+        self.save_config()
+
+    def _sub_player_ready(self):
+        if self.player is None:
+            self.status_var.set("当前使用外部播放器，无法加载外挂字幕")
+            return False
+        if not self.current_url:
+            self.status_var.set("请先播放视频，再加载字幕")
+            return False
+        return True
+
+    def load_subtitle_dialog(self):
+        if not self._sub_player_ready():
+            return
+        exts = " ".join("*" + e for e in sorted(SUB_EXTS))
+        kw = {"title": "选择外挂字幕",
+              "filetypes": [("字幕文件", exts), ("所有文件", "*.*")]}
+        if is_local_media_file(self.current_url):
+            kw["initialdir"] = os.path.dirname(os.path.abspath(self.current_url))
+        p = filedialog.askopenfilename(**kw)
+        if p:
+            self.apply_subtitle(p)
+
+    def apply_subtitle(self, path):
+        if not self._sub_player_ready():
+            return False
+        if not os.path.isfile(path):
+            self.status_var.set("字幕文件不存在：%s" % path)
+            return False
+        real = prepare_sub_file(path)
+        ok = False
+        try:
+            if hasattr(self.player, "add_slave"):
+                ok = (self.player.add_slave(
+                    vlc.MediaSlaveType.subtitle,
+                    self._path_to_mrl(real), True) == 0)
+        except Exception:
+            ok = False
+        if not ok:
+            try:
+                ok = (self.player.video_set_subtitle_file(real) == 1)
+            except Exception:
+                ok = False
+        if ok:
+            self._flash_seek_status("已加载字幕：%s" % os.path.basename(path))
+            self.after(1000, self._ensure_sub_selected)
+        else:
+            self.status_var.set("字幕加载失败：%s" % os.path.basename(path))
+        return ok
+
+    def _ensure_sub_selected(self):
+        if self.player is None or getattr(self, "_closing", False):
+            return
+        try:
+            if self.player.video_get_spu() == -1:
+                tracks = self.player.video_get_spu_description() or []
+                real = [t for t in tracks if t[0] != -1]
+                if real:
+                    self.player.video_set_spu(real[-1][0])
+        except Exception:
+            pass
+
+    def _attach_sibling_subs(self, media, path):
+        if not self.cfg.get("sub_auto_load", True):
+            return
+        try:
+            subs = find_sibling_subs(path)
+        except Exception:
+            return
+        for i, s in enumerate(subs):
+            try:
+                media.slaves_add(vlc.MediaSlaveType.subtitle,
+                                 4 if i == 0 else 3,
+                                 self._path_to_mrl(prepare_sub_file(s)))
+            except Exception:
+                pass
+
+    def disable_subtitle(self):
+        if self.player is None:
+            return
+        try:
+            self.player.video_set_spu(-1)
+            self._flash_seek_status("已关闭字幕")
+        except Exception:
+            pass
+
+    def select_sub_track(self, tid):
+        if self.player is None:
+            return
+        try:
+            self.player.video_set_spu(tid)
+        except Exception:
+            pass
+
+    def adjust_sub_delay(self, delta_ms, reset=False):
+        if self.player is None:
+            return
+        try:
+            cur = self.player.video_get_spu_delay()
+            new = 0 if reset else cur + int(delta_ms) * 1000
+            self.player.video_set_spu_delay(new)
+            self._flash_seek_status("字幕延迟：%+.1f 秒" % (new / 1000000.0))
+        except Exception:
+            pass
+
+    def _rebuild_sub_track_menu(self):
+        m = self.sub_track_menu
+        m.delete(0, tk.END)
+        tracks, cur = [], -1
+        if self.player is not None and self.current_url:
+            try:
+                tracks = self.player.video_get_spu_description() or []
+                cur = self.player.video_get_spu()
+            except Exception:
+                tracks, cur = [], -1
+        if not tracks:
+            m.add_command(label="（无可用字幕轨道）", state="disabled")
+            return
+        self._sub_track_var = tk.IntVar(value=cur)
+        for tid, name in tracks:
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", "replace")
+            m.add_radiobutton(label=name, variable=self._sub_track_var,
+                              value=tid,
+                              command=lambda t=tid: self.select_sub_track(t))
 
     def take_snapshot(self):
         if self.player is None:
@@ -5017,6 +5247,8 @@ class IPTVApp(tk.Tk):
                              ("any" if self.cfg.get("hw_decode", True) else "none"))
         except Exception:
             pass
+
+        self._attach_sibling_subs(media, path)
 
         try:
             self.player.set_media(media)
