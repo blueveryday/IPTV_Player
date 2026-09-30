@@ -1560,6 +1560,8 @@ class IPTVApp(tk.Tk):
         self.audio_poster = None
         self._poster_check_id = None
         self._poster_check_tries = 0
+        self._num_buffer = ""
+        self._num_after_id = None
 
         self._setup_ttk_style()
         self.build_menu()
@@ -1943,7 +1945,7 @@ class IPTVApp(tk.Tk):
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.ch_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.ch_list.bind("<ButtonRelease-1>", self._on_channel_click)
-        self.ch_list.bind("<Return>", lambda e: self.play_live())
+        self.ch_list.bind("<Return>", self._on_list_return)
         self.ch_list.bind("<<ListboxSelect>>", lambda e: self.on_channel_select())
         self.ch_list.bind("<Up>", self._on_arrow_up)
         self.ch_list.bind("<Down>", self._on_arrow_down)
@@ -2123,6 +2125,9 @@ class IPTVApp(tk.Tk):
 
         self.bind("<space>", self._on_space_key)
         self.bind("<KP_Space>", self._on_space_key)
+
+        self.bind("<Key>", self._on_digit_key)
+        self.bind("<BackSpace>", self._on_backspace_key)
 
         self.bind("<Left>", self._on_arrow_left)
         self.bind("<Right>", self._on_arrow_right)
@@ -2675,7 +2680,7 @@ class IPTVApp(tk.Tk):
             cls = w.winfo_class()
         except Exception:
             return False
-        return cls in ("TEntry", "Entry", "Text",
+        return cls in ("TEntry", "Entry", "Text", "TCombobox", "ComboBox",
                        "TScale", "TSpinbox", "Spinbox")
 
     def _is_local_media(self, ch):
@@ -2904,6 +2909,109 @@ class IPTVApp(tk.Tk):
         if not self.webdav_mode:
             self.play_live()
         return "break"
+
+    # ---------- 数字键遥控输入 ----------
+    NUM_INPUT_TIMEOUT_MS = 1500
+
+    def _on_list_return(self, event=None):
+        if self._num_buffer:
+            if self._num_after_id is not None:
+                try:
+                    self.after_cancel(self._num_after_id)
+                except Exception:
+                    pass
+                self._num_after_id = None
+            self._commit_number_input()
+            return "break"
+        self.play_live()
+        return "break"
+
+    def _on_digit_key(self, event):
+        if getattr(self, "_closing", False):
+            return None
+        if event.state & 0x0004:
+            return None
+        if self._focus_is_text_input():
+            return None
+        if self.webdav_mode:
+            return None
+        ch = event.char
+        if not ch or len(ch) != 1 or ch not in "0123456789":
+            return None
+        self._num_buffer += ch
+        if len(self._num_buffer) > 6:
+            self._num_buffer = self._num_buffer[-6:]
+        self._update_num_status()
+        self._reset_num_timer()
+        return "break"
+
+    def _on_backspace_key(self, event):
+        if getattr(self, "_closing", False):
+            return None
+        if self._focus_is_text_input():
+            return None
+        if not self._num_buffer:
+            return None
+        self._num_buffer = self._num_buffer[:-1]
+        self._update_num_status()
+        if self._num_buffer:
+            self._reset_num_timer()
+        else:
+            if self._num_after_id is not None:
+                try:
+                    self.after_cancel(self._num_after_id)
+                except Exception:
+                    pass
+                self._num_after_id = None
+            self._restore_play_status()
+        return "break"
+
+    def _update_num_status(self):
+        total = len(self.filtered)
+        sec = self.NUM_INPUT_TIMEOUT_MS / 1000.0
+        sec_txt = ("%g" % sec)
+        self.status_var.set(
+            "频道号：%s  （共 %d 个，%s 秒内无输入自动播放，Enter 立即播放）"
+            % (self._num_buffer, total, sec_txt))
+
+    def _reset_num_timer(self):
+        if self._num_after_id is not None:
+            try:
+                self.after_cancel(self._num_after_id)
+            except Exception:
+                pass
+        self._num_after_id = self.after(
+            self.NUM_INPUT_TIMEOUT_MS, self._commit_number_input)
+
+    def _commit_number_input(self):
+        self._num_after_id = None
+        buf = self._num_buffer
+        self._num_buffer = ""
+        if not buf:
+            return
+        try:
+            num = int(buf)
+        except ValueError:
+            return
+        self._play_channel_by_number(num)
+
+    def _play_channel_by_number(self, num):
+        if self.webdav_mode:
+            return
+        total = len(self.filtered)
+        if total == 0:
+            self.status_var.set("频道列表为空")
+            return
+        if num < 1 or num > total:
+            self.status_var.set("没有编号 %d 的频道（共 %d 个）" % (num, total))
+            return
+        idx = num - 1
+        self.ch_list.selection_clear(0, tk.END)
+        self.ch_list.selection_set(idx)
+        self.ch_list.activate(idx)
+        self.ch_list.see(idx)
+        self.on_channel_select()
+        self.play_live()
 
     def _on_slot_click(self, event=None):
         if self._slots_locked:
@@ -4096,8 +4204,11 @@ class IPTVApp(tk.Tk):
         else:
             self.filtered = list(source)
         self.ch_list.delete(0, tk.END)
-        for c in self.filtered:
-            self.ch_list.insert(tk.END, c["name"])
+        for i, c in enumerate(self.filtered):
+            if self.webdav_mode:
+                self.ch_list.insert(tk.END, c["name"])
+            else:
+                self.ch_list.insert(tk.END, "%d  %s" % (i + 1, c["name"]))
         if self.webdav_mode:
             self.count_var.set("%d / %d 项" % (len(self.filtered), len(source)))
         else:
@@ -4986,6 +5097,13 @@ class IPTVApp(tk.Tk):
             except Exception:
                 pass
             self._progress_after_id = None
+
+        if self._num_after_id is not None:
+            try:
+                self.after_cancel(self._num_after_id)
+            except Exception:
+                pass
+            self._num_after_id = None
 
         if self._closing_after_id:
             try:
