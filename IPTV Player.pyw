@@ -13,15 +13,10 @@ import struct
 import threading
 import tempfile
 import hashlib
-import zipfile
 import urllib.request
 import urllib.parse
 import urllib.error
 import base64
-import xml.etree.ElementTree as ET
-import webbrowser
-import http.server
-import socketserver
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta, timezone
@@ -143,6 +138,7 @@ def portable_vlc_target():
 
 
 def download_portable_vlc(dest_dir, progress, base=None):
+    import zipfile
     arch = "win64" if PY_BITS == 64 else "win32"
     base = base or "https://download.videolan.org/pub/videolan/vlc/last/%s/" % arch
     hdr = {"User-Agent": "Mozilla/5.0 (IPTVPlayer)"}
@@ -258,19 +254,27 @@ def prepare_vlc_path():
 
 
 VLC_MATCH_DIR, VLC_INSTALLS = None, []
-if sys.platform.startswith("win"):
-    VLC_MATCH_DIR, VLC_INSTALLS = prepare_vlc_path()
-
 vlc = None
 VLC_IMPORT_ERROR = None
-try:
-    import vlc
-except ModuleNotFoundError:
-    vlc = None
-    VLC_IMPORT_ERROR = "missing"
-except (Exception, SystemExit) as _e:
-    vlc = None
-    VLC_IMPORT_ERROR = "libvlc:%s: %s" % (type(_e).__name__, _e)
+_VLC_LOADED = False
+
+
+def load_vlc_module():
+    global vlc, VLC_IMPORT_ERROR, VLC_MATCH_DIR, VLC_INSTALLS, _VLC_LOADED
+    if _VLC_LOADED:
+        return
+    _VLC_LOADED = True
+    if sys.platform.startswith("win"):
+        VLC_MATCH_DIR, VLC_INSTALLS = prepare_vlc_path()
+    try:
+        import vlc as _v
+        vlc = _v
+    except ModuleNotFoundError:
+        vlc = None
+        VLC_IMPORT_ERROR = "missing"
+    except (Exception, SystemExit) as _e:
+        vlc = None
+        VLC_IMPORT_ERROR = "libvlc:%s: %s" % (type(_e).__name__, _e)
 
 
 def describe_vlc_problem(err):
@@ -758,6 +762,8 @@ class HLSRewriteProxy(object):
         return "\n".join(out) + "\n"
 
     def start(self):
+        import http.server
+        import socketserver
         proxy = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -940,6 +946,7 @@ DEFAULT_CONFIG = {
     "volume": 100,
     "left_width": 200,
     "epg_auto_update": True,
+    "epg_start_delay": 30,
     "epg_host": "http://123.147.117.163:8081",
     "epg_path": "/resource/schedules_v2/{channelcode}_{date}.json",
     "epg_date_fmt": "%Y%m%d",
@@ -1281,6 +1288,7 @@ class WebDAVClient:
         return h
 
     def list(self, rel_path=""):
+        import xml.etree.ElementTree as ET
         rel = (rel_path or "").strip("/")
 
         if rel:
@@ -1645,12 +1653,20 @@ def epg_update_worker(state, today, n, force_dates):
         miss = _load_miss()
         now_ts = time.time()
         jobs = []
+        listed = {}
         for code, title in channels:
             folder = os.path.join(EPG_DIR, epg_folder_name(title))
+            if folder not in listed:
+                try:
+                    listed[folder] = set(os.listdir(folder))
+                except OSError:
+                    listed[folder] = set()
+            have = listed[folder]
             for d in dates:
-                fp = os.path.join(folder, "%s_%s.json" % (code, d))
+                fn = "%s_%s.json" % (code, d)
+                fp = os.path.join(folder, fn)
                 if d not in force_dates:
-                    if os.path.isfile(fp):
+                    if fn in have:
                         continue
                     if now_ts - miss.get("%s_%s" % (code, d), 0) < EPG_MISS_TTL:
                         continue
@@ -1808,12 +1824,13 @@ class IPTVApp(tk.Tk):
         self._setup_ttk_style()
         self.build_menu()
         self.build_ui()
-        self.init_player()
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.after(20, self.init_player)
         self.after(200, self.load_default)
         self.after(500, self._update_progress)
-        self.after(1500, self.auto_epg_update)
+        self.after(max(1, int(self.cfg.get("epg_start_delay", 30))) * 1000,
+                   self.auto_epg_update)
 
     def _setup_ttk_style(self):
         style = ttk.Style(self)
@@ -2121,6 +2138,7 @@ class IPTVApp(tk.Tk):
             anchor="w", padx=20, pady=(8, 2))
 
         def open_link(_e=None):
+            import webbrowser
             try:
                 webbrowser.open(GITHUB_URL)
             except Exception as e:
@@ -5018,6 +5036,7 @@ class IPTVApp(tk.Tk):
         self.refresh_slots()
 
     def init_player(self):
+        load_vlc_module()
         if vlc is None:
             if (VLC_IMPORT_ERROR == "missing" and self.cfg.get("auto_install_vlc", True)
                     and not getattr(sys, "frozen", False)):
