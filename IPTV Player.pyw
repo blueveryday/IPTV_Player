@@ -4885,6 +4885,7 @@ class IPTVApp(tk.Tk):
             self.player.set_media(media)
             self.player.play()
             self.player.audio_set_volume(self.vol_var.get())
+            self._schedule_audio_apply()
             self.status_var.set("正在播放：%s" % item["name"])
             if self._muted:
                 try:
@@ -5277,6 +5278,7 @@ class IPTVApp(tk.Tk):
                 print("[play] player.play() returned -1 for", path)
                 return
             self.player.audio_set_volume(self.vol_var.get())
+            self._schedule_audio_apply()
             self.status_var.set("正在播放：%s" % title)
             if self._muted:
                 try:
@@ -5398,6 +5400,7 @@ class IPTVApp(tk.Tk):
             self.player.set_media(media)
             self.player.play()
             self.player.audio_set_volume(self.vol_var.get())
+            self._schedule_audio_apply()
             if self._muted:
                 try:
                     self.player.audio_set_mute(True)
@@ -5657,6 +5660,20 @@ class IPTVApp(tk.Tk):
                 self._flash_seek_status("已取消静音")
         except Exception:
             pass
+
+    def _apply_audio_state(self):
+        if self.player is None or getattr(self, "_closing", False):
+            return
+        try:
+            self.player.audio_set_mute(bool(self._muted))
+            self.player.audio_set_volume(
+                max(0, min(125, int(self.vol_var.get()))))
+        except Exception:
+            pass
+
+    def _schedule_audio_apply(self):
+        for ms in (300, 1000, 2500):
+            self.after(ms, self._apply_audio_state)
 
     def on_volume(self, _v=None):
         try:
