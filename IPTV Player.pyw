@@ -3971,7 +3971,9 @@ class IPTVApp(tk.Tk):
             label = "录像" if self.rec_mode == "video" else "录音"
             text = "正在%s：%s" % (label, os.path.basename(self.rec_path))
         elif self.current_url:
-            if self._is_file_playback():
+            if self._is_local_media(self.current):
+                text = "正在播放：%s" % self.current_url
+            elif self._is_file_playback():
                 text = "正在播放：%s  %s" % (self.current_title, self.current_url)
             else:
                 text = "正在播放：%s" % self.current_title
@@ -5228,7 +5230,7 @@ class IPTVApp(tk.Tk):
 
         if self.player is None:
             self.play_external(path)
-            self.status_var.set("正在使用外部播放器：%s" % title)
+            self.status_var.set("正在使用外部播放器：%s" % path)
             return
 
         if not os.path.isfile(path):
@@ -5280,7 +5282,7 @@ class IPTVApp(tk.Tk):
                 return
             self.player.audio_set_volume(self.vol_var.get())
             self._schedule_audio_apply()
-            self.status_var.set("正在播放：%s" % title)
+            self.status_var.set("正在播放：%s" % path)
             if self._muted:
                 try:
                     self.player.audio_set_mute(True)
