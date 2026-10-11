@@ -991,7 +991,10 @@ class SeekBar(tk.Canvas):
             v = float(v)
         except Exception:
             return
-        self._value = max(0.0, min(1000.0, v))
+        v = max(0.0, min(1000.0, v))
+        if v == self._value:
+            return
+        self._value = v
         self._redraw()
 
     def get_value(self):
@@ -1490,17 +1493,46 @@ EPG_XML = os.path.join(EPG_DIR, "iptv_epg.xml")
 EPG_EXT_MAP = os.path.join(EPG_DIR, ".ext_map.json")
 EPG_RESERVED = {"iptv_epg.xml"}
 EPG_TZ_HOURS = 8
+
 _epg_xml_cache = {
     "sig": None, "progs": {}, "names": {}, "labels": [],
     "label_sources": {}, "files": [],
 }
 EPG_ALIAS = {}
+EPG_CHAN_NAMES = []
+EPG_KEEP_DAYS = 7
+_EPG_WANTED = frozenset()
+_EPG_WANTED_SIG = 0
+_epg_lock = threading.Lock()
+
+
+def _recompute_wanted():
+    global _EPG_WANTED, _EPG_WANTED_SIG
+    keys = set()
+    for n in EPG_CHAN_NAMES:
+        k = _norm_name(n)
+        if k:
+            keys.add(k)
+    for v in EPG_ALIAS.values():
+        if v:
+            keys.add(_norm_name(v))
+            if "_" in v:
+                keys.add(_norm_name(v.rsplit("_", 1)[0]))
+    _EPG_WANTED = frozenset(keys)
+    _EPG_WANTED_SIG = hash(_EPG_WANTED)
+    _epg_xml_cache["sig"] = None
+
+
+def set_epg_channels(names):
+    global EPG_CHAN_NAMES
+    EPG_CHAN_NAMES = list(names or [])
+    _recompute_wanted()
 
 
 def set_epg_alias(d):
     global EPG_ALIAS
     EPG_ALIAS = dict(d or {})
-    _epg_xml_cache["sig"] = None
+    _recompute_wanted()
 
 
 def load_epg_alias_file():
@@ -1539,14 +1571,18 @@ def save_epg_sources_file(lst):
     except Exception:
         return False
 
-def set_epg_tz(h):
-    global EPG_TZ_HOURS
+def set_epg_tz(h, days=None):
+    global EPG_TZ_HOURS, EPG_KEEP_DAYS
     try:
         EPG_TZ_HOURS = int(h)
     except Exception:
         EPG_TZ_HOURS = 8
+    if days is not None:
+        try:
+            EPG_KEEP_DAYS = max(1, int(days))
+        except Exception:
+            EPG_KEEP_DAYS = 7
     _epg_xml_cache["sig"] = None
-
 
 def _norm_name(s):
     return re.sub(r'[\\/:*?"<>|_\s\-]+', "", s or "").lower()
@@ -1584,13 +1620,20 @@ def _open_epg_file(path):
     return gzip.open(path, "rb") if magic == b"\x1f\x8b" else open(path, "rb")
 
 
-def _parse_epg_xml_file(path, prefix):
+def _parse_epg_xml_file(path, prefix, wanted, lo, hi):
     progs, names, labels = {}, {}, set()
+    want_ids = set()
     fobj = None
     try:
         fobj = _open_epg_file(path)
-        for _ev, el in ET.iterparse(fobj, events=("end",)):
-            if el.tag == "channel":
+        root = None
+        for ev, el in ET.iterparse(fobj, events=("start", "end")):
+            if ev == "start":
+                if root is None:
+                    root = el
+                continue
+            tag = el.tag
+            if tag == "channel":
                 cid = (el.get("id") or "").strip()
                 if cid:
                     keys = {_norm_name(cid)}
@@ -1604,16 +1647,19 @@ def _parse_epg_xml_file(path, prefix):
                         if k:
                             names.setdefault(k, set()).add(prefix + cid)
                     labels.update(dns or [cid])
-                el.clear()
-            elif el.tag == "programme":
-                st = _parse_xmltv_time(el.get("start"), EPG_TZ_HOURS)
-                et = _parse_xmltv_time(el.get("stop"), EPG_TZ_HOURS)
-                if st and et and et > st:
-                    t = el.find("title")
-                    title = ((t.text or "") if t is not None else "").strip()
-                    cid = (el.get("channel") or "").strip()
-                    progs.setdefault(prefix + cid, []).append((st, et, title))
-                el.clear()
+                    if not wanted or any(k in wanted for k in keys):
+                        want_ids.add(cid)
+                root.clear()
+            elif tag == "programme":
+                cid = (el.get("channel") or "").strip()
+                if cid and (not wanted or cid in want_ids):
+                    st = _parse_xmltv_time(el.get("start"), EPG_TZ_HOURS)
+                    et = _parse_xmltv_time(el.get("stop"), EPG_TZ_HOURS)
+                    if st and et and et > st and et > lo and st < hi:
+                        t = el.find("title")
+                        title = ((t.text or "") if t is not None else "").strip()
+                        progs.setdefault(prefix + cid, []).append((st, et, title))
+                root.clear()
     except Exception:
         pass
     finally:
@@ -1623,6 +1669,64 @@ def _parse_epg_xml_file(path, prefix):
         except Exception:
             pass
     return progs, names, labels
+
+
+def _get_epg_xml_index(block=False):
+    files = ([EPG_XML] if os.path.isfile(EPG_XML) else []) + _epg_ext_files()
+    sig = [EPG_TZ_HOURS, EPG_KEEP_DAYS, _EPG_WANTED_SIG]
+    for p in files:
+        try:
+            s = os.stat(p)
+            sig.append((p, s.st_mtime, s.st_size))
+        except OSError:
+            pass
+    sig = tuple(sig)
+    c = _epg_xml_cache
+    if c["sig"] == sig:
+        return c["progs"], c["names"]
+    if not _epg_lock.acquire(block):
+        return c["progs"], c["names"]
+    try:
+        if c["sig"] == sig:
+            return c["progs"], c["names"]
+        now = (datetime.now(timezone.utc).replace(tzinfo=None)
+               + timedelta(hours=EPG_TZ_HOURS))
+        lo = now - timedelta(days=EPG_KEEP_DAYS + 1)
+        hi = now + timedelta(days=3)
+        wanted = _EPG_WANTED
+
+        progs, names, labels = {}, {}, set()
+        label_sources = {}
+        primary_keys = set()
+        for i, p in enumerate(files):
+            is_primary = (p == EPG_XML)
+            stem = os.path.splitext(os.path.basename(p))[0] or (
+                "iptv_epg" if is_primary else "epg")
+            fp, fn, fl = _parse_epg_xml_file(
+                p, "" if is_primary else "%d:" % i, wanted, lo, hi)
+            for lb in fl:
+                label_sources.setdefault(lb, set()).add(stem)
+            labels |= fl
+            if is_primary:
+                primary_keys = set(fn)
+            elif primary_keys:
+                drop = set()
+                for k, ids in fn.items():
+                    if k in primary_keys:
+                        drop |= ids
+                if drop:
+                    fp = {cid: v for cid, v in fp.items() if cid not in drop}
+                    fn = {k: ids - drop for k, ids in fn.items()}
+                    fn = {k: ids for k, ids in fn.items() if ids}
+            progs.update(fp)
+            for k, ids in fn.items():
+                names.setdefault(k, set()).update(ids)
+        c.update(sig=sig, progs=progs, names=names,
+                 labels=sorted(labels, key=lambda x: (_norm_name(x), x)),
+                 label_sources=label_sources, files=files)
+        return progs, names
+    finally:
+        _epg_lock.release()
 
 
 def _id_file_stem(cid, files):
@@ -1636,50 +1740,6 @@ def _id_file_stem(cid, files):
             return stem or None
         return None
     return "iptv_epg"
-
-
-def _get_epg_xml_index():
-    files = ([EPG_XML] if os.path.isfile(EPG_XML) else []) + _epg_ext_files()
-    sig = [EPG_TZ_HOURS]
-    for p in files:
-        try:
-            s = os.stat(p)
-            sig.append((p, s.st_mtime, s.st_size))
-        except OSError:
-            pass
-    sig = tuple(sig)
-    c = _epg_xml_cache
-    if c["sig"] == sig:
-        return c["progs"], c["names"]
-
-    progs, names, labels = {}, {}, set()
-    label_sources = {}
-    primary_keys = set()
-    for i, p in enumerate(files):
-        is_primary = (p == EPG_XML)
-        stem = os.path.splitext(os.path.basename(p))[0] or ("iptv_epg" if is_primary else "epg")
-        fp, fn, fl = _parse_epg_xml_file(p, "" if is_primary else "%d:" % i)
-        for lb in fl:
-            label_sources.setdefault(lb, set()).add(stem)
-        labels |= fl
-        if is_primary:
-            primary_keys = set(fn)
-        elif primary_keys:
-            drop = set()
-            for k, ids in fn.items():
-                if k in primary_keys:
-                    drop |= ids
-            if drop:
-                fp = {cid: v for cid, v in fp.items() if cid not in drop}
-                fn = {k: ids - drop for k, ids in fn.items()}
-                fn = {k: ids for k, ids in fn.items() if ids}
-        progs.update(fp)
-        for k, ids in fn.items():
-            names.setdefault(k, set()).update(ids)
-    c.update(sig=sig, progs=progs, names=names,
-             labels=sorted(labels, key=lambda x: (_norm_name(x), x)),
-             label_sources=label_sources, files=files)
-    return progs, names
 
 
 def _split_alias_value(alias_val):
@@ -2305,6 +2365,11 @@ class IPTVApp(tk.Tk):
         self._num_after_id = None
 
         self._snapshot_pending = []
+        self._play_req = None
+        self._play_worker_running = False
+        self._req_lock = threading.Lock()
+        self._vlc_lock = threading.Lock()
+        self._player_error_pending = False
 
         self._left_drag_w = 0
         self._right_drag_w = 0
@@ -2500,7 +2565,7 @@ class IPTVApp(tk.Tk):
         if not isinstance(sources, list):
             sources = []
         self.cfg["epg_sources"] = sources
-        set_epg_tz(self.cfg.get("tz_offset", 8))
+        set_epg_tz(self.cfg.get("tz_offset", 8), self.cfg.get("replay_days", 7))
 
         alias = load_epg_alias_file()
         old = self.cfg.get("epg_alias")
@@ -4662,6 +4727,9 @@ class IPTVApp(tk.Tk):
 
     def _update_progress(self):
         self._progress_after_id = None
+        if self._player_error_pending:
+            self._player_error_pending = False
+            self._on_player_error()
         try:
             if self.seek_bar.is_dragging():
                 pass
@@ -5729,6 +5797,9 @@ class IPTVApp(tk.Tk):
                              "无法读取目录：%s\n\n%s" % (path or "/", err))
 
     def _play_webdav_file(self, item):
+        self._cancel_play_req()
+        with self._vlc_lock:
+            pass
         self._stop_recording_for_switch()
         try:
             if not self.recording:
@@ -5883,6 +5954,11 @@ class IPTVApp(tk.Tk):
         except Exception as e:
             messagebox.showerror("错误", "读取 m3u 失败：%s" % e)
             return
+
+        set_epg_channels([c["name"] for c in self.channels])
+        self._epg_color_set = None
+        self._start_epg_color_load()
+
         self.apply_filter()
         self._refresh_webdav_combo()
         self.status_var.set("已加载 %d 个频道：%s" % (len(self.channels), path))
@@ -5903,7 +5979,7 @@ class IPTVApp(tk.Tk):
         def worker():
             result = set()
             try:
-                _, names = _get_epg_xml_index()
+                _, names = _get_epg_xml_index(block=True)
                 result = set(names.keys())
                 for k in EPG_ALIAS.keys():
                     if k:
@@ -5921,6 +5997,7 @@ class IPTVApp(tk.Tk):
         self._epg_color_set = s
         self._epg_color_loading = False
         self._apply_epg_colors_to_list()
+        self.refresh_slots()
 
     def _apply_epg_colors_to_list(self):
         s = self._epg_color_set
@@ -6019,7 +6096,8 @@ class IPTVApp(tk.Tk):
             self.player.video_set_key_input(False)
             self.player.audio_set_volume(self.vol_var.get())
 
-            self._player_error_cb = lambda e: self.after(0, self._on_player_error)
+            self._player_error_cb = lambda e: setattr(
+                self, "_player_error_pending", True)
             em = self.player.event_manager()
             em.event_attach(vlc.EventType.MediaPlayerEncounteredError,
                             self._player_error_cb)
@@ -6158,6 +6236,9 @@ class IPTVApp(tk.Tk):
                 "%s\n\n可稍后重试（文件 → 下载免安装 VLC 组件），或在“回看参数设置”里指定 PotPlayer 等外部播放器。" % msg)
 
     def _play_local_file(self, path, title):
+        self._cancel_play_req()
+        with self._vlc_lock:
+            pass
         self._stop_recording_for_switch()
         try:
             if not self.recording:
@@ -6317,6 +6398,47 @@ class IPTVApp(tk.Tk):
         else:
             self._show_audio_poster(False)
 
+    def _request_play(self, url, opts=None, volume=100):
+        with self._req_lock:
+            self._play_req = (url, list(opts or []), volume)
+            if self._play_worker_running:
+                return
+            self._play_worker_running = True
+        threading.Thread(target=self._play_worker, daemon=True).start()
+
+    def _cancel_play_req(self):
+        with self._req_lock:
+            self._play_req = None
+
+    def _play_worker(self):
+        while True:
+            time.sleep(0.15)
+            with self._req_lock:
+                req = self._play_req
+                self._play_req = None
+                if req is None or self._closing:
+                    self._play_worker_running = False
+                    return
+            url, opts, vol = req
+            with self._vlc_lock:
+                try:
+                    player = self.player
+                    inst = self.vlc_instance
+                    if player is None or inst is None:
+                        continue
+                    player.stop()
+                    if self._play_req is not None:
+                        continue
+                    if url:
+                        media = inst.media_new(url)
+                        for o in opts:
+                            media.add_option(o)
+                        player.set_media(media)
+                        media.release()
+                        player.play()
+                        player.audio_set_volume(vol)
+                except Exception:
+                    pass
 
     def play_url(self, url, title, live=True):
         self._cancel_seek_status_timer()
@@ -6338,24 +6460,17 @@ class IPTVApp(tk.Tk):
             except Exception:
                 pass
         if self.player is not None:
-            media = self.vlc_instance.media_new(url)
             low = url.lower()
+            opts = []
             if low.startswith("rtsp://"):
                 if self.cfg.get("rtsp_tcp", True):
-                    media.add_option(":rtsp-tcp")
+                    opts.append(":rtsp-tcp")
             else:
-                media.add_option(":http-reconnect=true")
-            media.add_option(":avcodec-hw=%s" %
-                             ("any" if self.cfg.get("hw_decode", True) else "none"))
-            self.player.set_media(media)
-            self.player.play()
-            self.player.audio_set_volume(self.vol_var.get())
+                opts.append(":http-reconnect=true")
+            opts.append(":avcodec-hw=%s" %
+                        ("any" if self.cfg.get("hw_decode", True) else "none"))
+            self._request_play(url, opts, self.vol_var.get())
             self._schedule_audio_apply()
-            if self._muted:
-                try:
-                    self.player.audio_set_mute(True)
-                except Exception:
-                    pass
         else:
             self.play_external(url)
         if not self.recording:
@@ -6478,7 +6593,7 @@ class IPTVApp(tk.Tk):
         ext = (self.cfg.get("replay_player") or "").strip()
         if ext:
             if self.player is not None:
-                self.player.stop()
+                self._request_play(None)
             self.kill_external()
             try:
                 self.ext_proc = subprocess.Popen([ext, url])
@@ -6521,7 +6636,6 @@ class IPTVApp(tk.Tk):
         except Exception:
             active = False
         if active:
-            self.player.stop()
             self.play_url(self.current_url, self.current_title, self.current_live)
             if not self.recording:
                 self.status_var.set("已切换（硬解=%s, RTSP-TCP=%s）并重新播放：%s" % (
@@ -6552,10 +6666,7 @@ class IPTVApp(tk.Tk):
             live = self.current_live
             if not url:
                 return
-            try:
-                self.player.stop()
-            except Exception:
-                pass
+
             self.play_url(url, title, live=live)
             if live:
                 self._refresh_live_bar()
@@ -6579,7 +6690,7 @@ class IPTVApp(tk.Tk):
 
         self._net_paused = False
         if self.player is not None:
-            self.player.stop()
+            self._request_play(None)
         self.kill_external()
         self._clear_replay_range()
         self.current = None
@@ -6817,8 +6928,8 @@ class IPTVApp(tk.Tk):
                 self.cfg["userid"] = vars_["userid"].get().strip()
                 self.cfg["authinfo"] = vars_["authinfo"].get().strip()
                 self.cfg["tz_offset"] = int(vars_["tz_offset"].get())
-                set_epg_tz(self.cfg["tz_offset"])
                 self.cfg["replay_days"] = max(1, int(vars_["replay_days"].get()))
+                set_epg_tz(self.cfg["tz_offset"], self.cfg["replay_days"])
             except ValueError:
                 messagebox.showerror("错误", "时区偏移与回看天数必须为整数", parent=win)
                 return
@@ -6906,6 +7017,7 @@ class IPTVApp(tk.Tk):
                 pass
             self._rec_poll_id = None
 
+        self._cancel_play_req()
         self.save_config()
 
         try:
@@ -6932,7 +7044,10 @@ class IPTVApp(tk.Tk):
 
     def _final_close(self):
         self._closing_after_id = None
-
+        try:
+            self._vlc_lock.acquire(timeout=1.5)
+        except Exception:
+            pass
         try:
             if self.player is not None:
                 try:
