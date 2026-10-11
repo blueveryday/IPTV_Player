@@ -322,9 +322,16 @@ def app_dir():
 APP_DIR = app_dir()
 DEFAULT_M3U = os.path.join(APP_DIR, "iptv.m3u")
 CONFIG_FILE = os.path.join(APP_DIR, "iptv_config.json")
-
 RECORD_DIR = os.path.join(APP_DIR, "record")
 
+def resolve_m3u_path(cfg):
+    p = (cfg.get("m3u_file") or "").strip().strip('"')
+    if not p:
+        return DEFAULT_M3U
+    p = os.path.expanduser(p)
+    if not os.path.isabs(p):
+        p = os.path.join(APP_DIR, p)
+    return os.path.normpath(p)
 
 def find_ffmpeg():
     exe = "ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg"
@@ -970,6 +977,7 @@ DEFAULT_CONFIG = {
     "webdav_sources": [],
     "record_stop_on_switch": True,
     "sub_auto_load": True,
+    "m3u_file": "",
 }
 
 
@@ -2365,11 +2373,20 @@ class IPTVApp(tk.Tk):
         self._num_after_id = None
 
         self._snapshot_pending = []
-        self._play_req = None
-        self._play_worker_running = False
-        self._req_lock = threading.Lock()
-        self._vlc_lock = threading.Lock()
-        self._player_error_pending = False
+
+        self._vlc_q = queue.Queue()
+        self._vlc_thread = None
+        self._play_token = 0
+
+        self._cache = {
+            "time": 0,
+            "length": 0,
+            "seekable": False,
+            "state": None,
+            "video_track_count": -1,
+            "spu_tracks": [],
+            "spu_current": -1,
+        }
 
         self._left_drag_w = 0
         self._right_drag_w = 0
@@ -2388,6 +2405,295 @@ class IPTVApp(tk.Tk):
         self.after(max(1, int(self.cfg.get("epg_start_delay", 30))) * 1000,
                    self.auto_epg_update)
         self.after(400, self._start_epg_color_load)
+
+    def _vlc_call(self, fn, *args, done=None):
+        if done is None:
+            self._vlc_q.put((fn, args, None))
+        else:
+            def wrapped(r, e):
+                if getattr(self, "_closing", False):
+                    return
+                try:
+                    self.after(0, lambda: done(r, e))
+                except Exception:
+                    pass
+            self._vlc_q.put((fn, args, wrapped))
+
+    def _vlc_worker_loop(self):
+        while True:
+            try:
+                item = self._vlc_q.get(timeout=0.25)
+            except queue.Empty:
+                try:
+                    self._refresh_cache()
+                except Exception:
+                    pass
+                continue
+            except Exception:
+                return
+
+            if item is None:
+                try:
+                    while True:
+                        self._vlc_q.get_nowait()
+                except queue.Empty:
+                    pass
+                return
+
+            try:
+                fn, args, done = item
+            except Exception:
+                continue
+            try:
+                r = fn(*args)
+                err = None
+            except Exception as e:
+                r = None
+                err = e
+            if done is not None:
+                try:
+                    done(r, err)
+                except Exception:
+                    pass
+
+    def _refresh_cache(self):
+        p = self.player
+        if p is None:
+            return
+        c = self._cache
+        try:
+            c["time"] = p.get_time()
+        except Exception:
+            pass
+        try:
+            c["length"] = p.get_length()
+        except Exception:
+            pass
+        try:
+            c["seekable"] = bool(p.is_seekable())
+        except Exception:
+            pass
+        try:
+            c["state"] = p.get_state()
+        except Exception:
+            pass
+        try:
+            c["video_track_count"] = p.video_get_track_count()
+        except Exception:
+            pass
+        try:
+            c["spu_tracks"] = list(p.video_get_spu_description() or [])
+        except Exception:
+            pass
+        try:
+            c["spu_current"] = p.video_get_spu()
+        except Exception:
+            pass
+
+
+    def _vlc_stop(self):
+        p = self.player
+        if p is None:
+            return
+        try:
+            p.stop()
+        except Exception:
+            pass
+
+    def _vlc_pause(self):
+        p = self.player
+        if p is None:
+            return
+        try:
+            p.pause()
+        except Exception:
+            pass
+
+    def _vlc_set_time(self, ms):
+        p = self.player
+        if p is None:
+            return
+        try:
+            p.set_time(int(ms))
+        except Exception:
+            pass
+
+    def _vlc_set_volume(self, vol, muted):
+        p = self.player
+        if p is None:
+            return
+        try:
+            p.audio_set_mute(bool(muted))
+            p.audio_set_volume(int(vol))
+        except Exception:
+            pass
+
+    def _vlc_play_media(self, url, opts, vol, muted):
+        p = self.player
+        inst = self.vlc_instance
+        if p is None or inst is None:
+            return
+        try:
+            p.stop()
+        except Exception:
+            pass
+        try:
+            media = inst.media_new(url)
+            for o in opts:
+                media.add_option(o)
+            p.set_media(media)
+            media.release()
+            p.play()
+            p.audio_set_volume(int(vol))
+            p.audio_set_mute(bool(muted))
+        except Exception:
+            pass
+
+    def _submit_play(self, url, opts, vol, muted):
+        self._play_token += 1
+        token = self._play_token
+
+        def _do():
+            if token != self._play_token:
+                return
+            self._vlc_play_media(url, opts, vol, muted)
+        self._vlc_call(_do)
+
+    def _submit_play_local(self, path, vol, muted, hw, auto_sub):
+        self._play_token += 1
+        token = self._play_token
+
+        def _do():
+            if token != self._play_token:
+                return
+            p = self.player
+            inst = self.vlc_instance
+            if p is None or inst is None:
+                return
+            try:
+                p.stop()
+            except Exception:
+                pass
+            media = None
+            try:
+                media = inst.media_new(self._path_to_mrl(path))
+            except Exception:
+                pass
+            if media is None or not media.get_mrl():
+                if media is not None:
+                    try:
+                        media.release()
+                    except Exception:
+                        pass
+                try:
+                    media = inst.media_new_path(path)
+                except Exception:
+                    media = None
+            if media is None:
+                return
+            try:
+                media.add_option(":avcodec-hw=%s"
+                                 % ("any" if hw else "none"))
+            except Exception:
+                pass
+            if auto_sub:
+                try:
+                    subs = find_sibling_subs(path)
+                except Exception:
+                    subs = []
+                for i, s in enumerate(subs):
+                    try:
+                        media.slaves_add(vlc.MediaSlaveType.subtitle,
+                                         4 if i == 0 else 3,
+                                         self._path_to_mrl(prepare_sub_file(s)))
+                    except Exception:
+                        pass
+            try:
+                p.set_media(media)
+                p.play()
+                p.audio_set_volume(int(vol))
+                p.audio_set_mute(bool(muted))
+            except Exception:
+                pass
+        self._vlc_call(_do)
+
+    def _vlc_add_subtitle(self, mrl, real_path):
+        p = self.player
+        if p is None:
+            return
+        ok = False
+        try:
+            if hasattr(p, "add_slave"):
+                ok = (p.add_slave(vlc.MediaSlaveType.subtitle, mrl, True) == 0)
+        except Exception:
+            ok = False
+        if not ok:
+            try:
+                p.video_set_subtitle_file(real_path)
+            except Exception:
+                pass
+
+    def _vlc_ensure_sub(self):
+        p = self.player
+        if p is None:
+            return
+        try:
+            if p.video_get_spu() == -1:
+                tracks = p.video_get_spu_description() or []
+                real = [t for t in tracks if t[0] != -1]
+                if real:
+                    p.video_set_spu(real[-1][0])
+        except Exception:
+            pass
+
+    def _vlc_set_spu(self, tid):
+        p = self.player
+        if p is None:
+            return
+        try:
+            p.video_set_spu(int(tid))
+        except Exception:
+            pass
+
+    def _vlc_adjust_spu_delay(self, delta_ms, reset):
+        p = self.player
+        if p is None:
+            return None
+        try:
+            cur = p.video_get_spu_delay()
+            new = 0 if reset else cur + int(delta_ms) * 1000
+            p.video_set_spu_delay(new)
+            return new
+        except Exception:
+            return None
+
+    def _vlc_take_snapshot(self, path):
+        p = self.player
+        if p is None:
+            return None
+        try:
+            return p.video_take_snapshot(0, path, 0, 0)
+        except Exception:
+            return None
+
+    def _vlc_cleanup(self):
+        p = self.player
+        if p is None:
+            return
+        try:
+            em = p.event_manager()
+            if self._player_error_cb is not None:
+                em.event_detach(vlc.EventType.MediaPlayerEncounteredError)
+        except Exception:
+            pass
+        try:
+            p.stop()
+        except Exception:
+            pass
+
+    def _cancel_play_req(self):
+        self._play_token += 1
+
 
     def _setup_ttk_style(self):
         style = ttk.Style(self)
@@ -4164,91 +4470,47 @@ class IPTVApp(tk.Tk):
             self.status_var.set("字幕文件不存在：%s" % path)
             return False
         real = prepare_sub_file(path)
-        ok = False
-        try:
-            if hasattr(self.player, "add_slave"):
-                ok = (self.player.add_slave(
-                    vlc.MediaSlaveType.subtitle,
-                    self._path_to_mrl(real), True) == 0)
-        except Exception:
-            ok = False
-        if not ok:
-            try:
-                ok = (self.player.video_set_subtitle_file(real) == 1)
-            except Exception:
-                ok = False
-        if ok:
-            self._flash_seek_status("已加载字幕：%s" % os.path.basename(path))
-            self.after(1000, self._ensure_sub_selected)
-        else:
-            self.status_var.set("字幕加载失败：%s" % os.path.basename(path))
-        return ok
+        mrl = self._path_to_mrl(real)
+        self._vlc_call(self._vlc_add_subtitle, mrl, real)
+        self._flash_seek_status("已加载字幕：%s" % os.path.basename(path))
+        self.after(1000, self._ensure_sub_selected)
+        return True
 
     def _ensure_sub_selected(self):
         if self.player is None or getattr(self, "_closing", False):
             return
-        try:
-            if self.player.video_get_spu() == -1:
-                tracks = self.player.video_get_spu_description() or []
-                real = [t for t in tracks if t[0] != -1]
-                if real:
-                    self.player.video_set_spu(real[-1][0])
-        except Exception:
-            pass
-
-    def _attach_sibling_subs(self, media, path):
-        if not self.cfg.get("sub_auto_load", True):
-            return
-        try:
-            subs = find_sibling_subs(path)
-        except Exception:
-            return
-        for i, s in enumerate(subs):
-            try:
-                media.slaves_add(vlc.MediaSlaveType.subtitle,
-                                 4 if i == 0 else 3,
-                                 self._path_to_mrl(prepare_sub_file(s)))
-            except Exception:
-                pass
+        self._vlc_call(self._vlc_ensure_sub)
 
     def disable_subtitle(self):
         if self.player is None:
             return
-        try:
-            self.player.video_set_spu(-1)
-            self._flash_seek_status("已关闭字幕")
-        except Exception:
-            pass
+        self._vlc_call(self._vlc_set_spu, -1)
+        self._flash_seek_status("已关闭字幕")
 
     def select_sub_track(self, tid):
         if self.player is None:
             return
-        try:
-            self.player.video_set_spu(tid)
-        except Exception:
-            pass
+        self._vlc_call(self._vlc_set_spu, tid)
 
     def adjust_sub_delay(self, delta_ms, reset=False):
         if self.player is None:
             return
-        try:
-            cur = self.player.video_get_spu_delay()
-            new = 0 if reset else cur + int(delta_ms) * 1000
-            self.player.video_set_spu_delay(new)
-            self._flash_seek_status("字幕延迟：%+.1f 秒" % (new / 1000000.0))
-        except Exception:
-            pass
+
+        def _done(new, _err):
+            if new is None:
+                return
+            try:
+                self._flash_seek_status("字幕延迟：%+.1f 秒" % (new / 1000000.0))
+            except Exception:
+                pass
+
+        self._vlc_call(self._vlc_adjust_spu_delay, delta_ms, reset, done=_done)
 
     def _rebuild_sub_track_menu(self):
         m = self.sub_track_menu
         m.delete(0, tk.END)
-        tracks, cur = [], -1
-        if self.player is not None and self.current_url:
-            try:
-                tracks = self.player.video_get_spu_description() or []
-                cur = self.player.video_get_spu()
-            except Exception:
-                tracks, cur = [], -1
+        tracks = list(self._cache.get("spu_tracks") or [])
+        cur = self._cache.get("spu_current", -1)
         if not tracks:
             m.add_command(label="（无可用字幕轨道）", state="disabled")
             return
@@ -4268,10 +4530,7 @@ class IPTVApp(tk.Tk):
             self.status_var.set("没有正在播放的内容，无法截图")
             return
 
-        try:
-            vtrack = self.player.video_get_track_count()
-        except Exception:
-            vtrack = -1
+        vtrack = self._cache.get("video_track_count", -1)
         if vtrack == 0:
             self.status_var.set("当前是纯音频，无画面可截图")
             return
@@ -4298,15 +4557,7 @@ class IPTVApp(tk.Tk):
             path = os.path.join(snap_dir, "%s_%s_%d.png" % (base, ts, n))
             n += 1
 
-        try:
-            ret = self.player.video_take_snapshot(0, path, 0, 0)
-        except Exception as e:
-            messagebox.showerror("截图失败", "调用截图接口出错：%s" % e)
-            return
-        if ret == -1:
-            self.status_var.set("截图失败：VLC 拒绝截图（可能是纯音频或画面尚未就绪）")
-            return
-
+        self._vlc_call(self._vlc_take_snapshot, path)
         self.status_var.set("正在保存截图…")
         self.after(600, lambda p=path: self._check_snapshot(p))
 
@@ -4574,13 +4825,8 @@ class IPTVApp(tk.Tk):
             pass
 
     def _update_local_media_progress(self):
-        if self.player is None:
-            return
-        try:
-            t = self.player.get_time()
-            l = self.player.get_length()
-        except Exception:
-            return
+        t = self._cache.get("time", 0)
+        l = self._cache.get("length", 0)
         if l and l > 0:
             self.seek_bar.set_enabled(True)
             pos = max(0, min(1000, int(t * 1000 / l)))
@@ -4653,10 +4899,7 @@ class IPTVApp(tk.Tk):
             if phase == "commit":
                 self.status_var.set("当前使用外部播放器，无法在程序内拖动进度")
             return
-        try:
-            length = self.player.get_length()
-        except Exception:
-            return
+        length = self._cache.get("length", 0)
         if not length or length <= 0:
             if phase == "commit":
                 self.status_var.set("媒体长度尚未就绪，暂时无法拖动")
@@ -4669,21 +4912,11 @@ class IPTVApp(tk.Tk):
             self.time_var.set("%s / %s" % (fmt_ms(target_ms), fmt_ms(length)))
             return
 
-        try:
-            if not self.player.is_seekable():
-                self.status_var.set("该媒体不支持跳转")
-                return
-        except Exception:
-            pass
+        if not self._cache.get("seekable", False):
+            self.status_var.set("该媒体不支持跳转")
+            return
 
-        try:
-            ret = self.player.set_time(target_ms)
-        except Exception as e:
-            self.status_var.set("拖动失败：%s" % e)
-            return
-        if ret == -1:
-            self.status_var.set("VLC 拒绝跳转")
-            return
+        self._vlc_call(self._vlc_set_time, target_ms)
         self.time_var.set("%s / %s" % (fmt_ms(target_ms), fmt_ms(length)))
         self._flash_seek_status("已跳转到 %s" % fmt_ms(target_ms))
 
@@ -4691,12 +4924,8 @@ class IPTVApp(tk.Tk):
         if self.player is None:
             self.status_var.set("当前使用外部播放器，无法在程序内快进/快退")
             return
-        try:
-            t = self.player.get_time()
-            l = self.player.get_length()
-        except Exception as e:
-            self.status_var.set("读取进度失败：%s" % e)
-            return
+        t = self._cache.get("time", 0)
+        l = self._cache.get("length", 0)
 
         if not l or l <= 0:
             self.status_var.set("媒体长度尚未就绪或不可 seek，请稍候再试")
@@ -4706,22 +4935,11 @@ class IPTVApp(tk.Tk):
 
         nt = max(0, min(l, t + int(delta_ms)))
 
-        try:
-            if not self.player.is_seekable():
-                self.status_var.set("该媒体不支持跳转（常见于未开启 Range 的 WebDAV）")
-                return
-        except Exception:
-            pass
-
-        try:
-            ret = self.player.set_time(nt)
-        except Exception as e:
-            self.status_var.set("跳转失败：%s" % e)
-            return
-        if ret == -1:
-            self.status_var.set("VLC 拒绝跳转（媒体可能尚未完全索引）")
+        if not self._cache.get("seekable", False):
+            self.status_var.set("该媒体不支持跳转（常见于未开启 Range 的 WebDAV）")
             return
 
+        self._vlc_call(self._vlc_set_time, nt)
         self.time_var.set("%s / %s" % (fmt_ms(nt), fmt_ms(l)))
         self._flash_seek_status("已跳转到 %s" % fmt_ms(nt))
 
@@ -5480,10 +5698,13 @@ class IPTVApp(tk.Tk):
         return self.slot_items[sel[0]]
 
     def load_default(self):
-        if os.path.exists(DEFAULT_M3U):
-            self.load_m3u(DEFAULT_M3U)
+        path = resolve_m3u_path(self.cfg)
+        if os.path.exists(path):
+            self.load_m3u(path)
         else:
-            self.status_var.set("未找到 %s，请通过“文件 → 打开 m3u 文件”加载" % DEFAULT_M3U)
+            self.status_var.set(
+                "未找到默认 m3u：%s，请通过“文件 → 打开 m3u 文件”加载，"
+                "或在 iptv_config.json 中设置 m3u_file" % path)
 
     def open_m3u(self):
         p = filedialog.askopenfilename(
@@ -5797,9 +6018,6 @@ class IPTVApp(tk.Tk):
                              "无法读取目录：%s\n\n%s" % (path or "/", err))
 
     def _play_webdav_file(self, item):
-        self._cancel_play_req()
-        with self._vlc_lock:
-            pass
         self._stop_recording_for_switch()
         try:
             if not self.recording:
@@ -5848,24 +6066,12 @@ class IPTVApp(tk.Tk):
         else:
             self._schedule_audio_poster_check()
 
-        try:
-            media = self.vlc_instance.media_new(url)
-            media.add_option(":http-reconnect=true")
-            media.add_option(":http-continuous")
-            media.add_option(":avcodec-hw=%s" %
-                            ("any" if self.cfg.get("hw_decode", True) else "none"))
-            self.player.set_media(media)
-            self.player.play()
-            self.player.audio_set_volume(self.vol_var.get())
-            self._schedule_audio_apply()
-            self.status_var.set("正在播放：%s" % item["name"])
-            if self._muted:
-                try:
-                    self.player.audio_set_mute(True)
-                except Exception:
-                    pass
-        except Exception as e:
-            self.status_var.set("播放失败：%s" % e)
+        opts = [":http-reconnect=true", ":http-continuous",
+                ":avcodec-hw=%s" % ("any" if self.cfg.get("hw_decode", True) else "none")]
+        vol = max(0, min(150, int(self.vol_var.get())))
+        muted = bool(self._muted)
+        self._submit_play(url, opts, vol, muted)
+        self.status_var.set("正在播放：%s" % item["name"])
 
     def open_media_file(self):
         all_exts = " ".join("*" + e for e in sorted(MEDIA_EXTS))
@@ -6101,6 +6307,11 @@ class IPTVApp(tk.Tk):
             em = self.player.event_manager()
             em.event_attach(vlc.EventType.MediaPlayerEncounteredError,
                             self._player_error_cb)
+
+            if self._vlc_thread is None:
+                self._vlc_thread = threading.Thread(
+                    target=self._vlc_worker_loop, daemon=True)
+                self._vlc_thread.start()
         except Exception as e:
             self.player = None
             self.status_var.set("VLC 初始化失败，改用外部播放器：%s" % e)
@@ -6236,9 +6447,6 @@ class IPTVApp(tk.Tk):
                 "%s\n\n可稍后重试（文件 → 下载免安装 VLC 组件），或在“回看参数设置”里指定 PotPlayer 等外部播放器。" % msg)
 
     def _play_local_file(self, path, title):
-        self._cancel_play_req()
-        with self._vlc_lock:
-            pass
         self._stop_recording_for_switch()
         try:
             if not self.recording:
@@ -6266,59 +6474,12 @@ class IPTVApp(tk.Tk):
             messagebox.showwarning("文件不存在", path, parent=self)
             return
 
-        media = None
-        try:
-            media = self.vlc_instance.media_new(self._path_to_mrl(path))
-        except Exception:
-            pass
-
-        if media is None or not media.get_mrl():
-            if media is not None:
-                try:
-                    media.release()
-                except Exception:
-                    pass
-            try:
-                media = self.vlc_instance.media_new_path(path)
-            except Exception:
-                media = None
-
-        if media is None:
-            self.status_var.set("VLC 无法识别该文件：%s" % path)
-            messagebox.showwarning(
-                "无法播放",
-                "VLC 无法创建媒体对象。\n可能原因：\n"
-                "• 文件被占用或损坏\n"
-                "• 路径含特殊字符\n"
-                "• VLC 未正确安装\n\n文件：%s" % path, parent=self)
-            return
-
-        try:
-            media.add_option(":avcodec-hw=%s" %
-                             ("any" if self.cfg.get("hw_decode", True) else "none"))
-        except Exception:
-            pass
-
-        self._attach_sibling_subs(media, path)
-
-        try:
-            self.player.set_media(media)
-            ret = self.player.play()
-            if ret == -1:
-                self.status_var.set("VLC 拒绝播放：%s" % title)
-                print("[play] player.play() returned -1 for", path)
-                return
-            self.player.audio_set_volume(self.vol_var.get())
-            self._schedule_audio_apply()
-            self.status_var.set("正在播放：%s" % path)
-            if self._muted:
-                try:
-                    self.player.audio_set_mute(True)
-                except Exception:
-                    pass
-        except Exception as e:
-            self.status_var.set("播放异常：%s" % e)
-            messagebox.showwarning("播放失败", str(e), parent=self)
+        vol = max(0, min(150, int(self.vol_var.get())))
+        muted = bool(self._muted)
+        hw = bool(self.cfg.get("hw_decode", True))
+        auto_sub = bool(self.cfg.get("sub_auto_load", True))
+        self._submit_play_local(path, vol, muted, hw, auto_sub)
+        self.status_var.set("正在播放：%s" % path)
 
     def _path_to_mrl(self, path):
         p = os.path.abspath(path).replace("\\", "/")
@@ -6383,11 +6544,7 @@ class IPTVApp(tk.Tk):
             return
         if not self.current_url:
             return
-        try:
-            vtrack = self.player.video_get_track_count()
-        except Exception:
-            vtrack = -1
-
+        vtrack = self._cache.get("video_track_count", -1)
         if vtrack is None or vtrack < 0:
             self._poster_check_tries += 1
             if self._poster_check_tries < 12:
@@ -6397,48 +6554,6 @@ class IPTVApp(tk.Tk):
             self._show_audio_poster(True)
         else:
             self._show_audio_poster(False)
-
-    def _request_play(self, url, opts=None, volume=100):
-        with self._req_lock:
-            self._play_req = (url, list(opts or []), volume)
-            if self._play_worker_running:
-                return
-            self._play_worker_running = True
-        threading.Thread(target=self._play_worker, daemon=True).start()
-
-    def _cancel_play_req(self):
-        with self._req_lock:
-            self._play_req = None
-
-    def _play_worker(self):
-        while True:
-            time.sleep(0.15)
-            with self._req_lock:
-                req = self._play_req
-                self._play_req = None
-                if req is None or self._closing:
-                    self._play_worker_running = False
-                    return
-            url, opts, vol = req
-            with self._vlc_lock:
-                try:
-                    player = self.player
-                    inst = self.vlc_instance
-                    if player is None or inst is None:
-                        continue
-                    player.stop()
-                    if self._play_req is not None:
-                        continue
-                    if url:
-                        media = inst.media_new(url)
-                        for o in opts:
-                            media.add_option(o)
-                        player.set_media(media)
-                        media.release()
-                        player.play()
-                        player.audio_set_volume(vol)
-                except Exception:
-                    pass
 
     def play_url(self, url, title, live=True):
         self._cancel_seek_status_timer()
@@ -6469,8 +6584,9 @@ class IPTVApp(tk.Tk):
                 opts.append(":http-reconnect=true")
             opts.append(":avcodec-hw=%s" %
                         ("any" if self.cfg.get("hw_decode", True) else "none"))
-            self._request_play(url, opts, self.vol_var.get())
-            self._schedule_audio_apply()
+            vol = max(0, min(150, int(self.vol_var.get())))
+            muted = bool(self._muted)
+            self._submit_play(url, opts, vol, muted)
         else:
             self.play_external(url)
         if not self.recording:
@@ -6593,7 +6709,8 @@ class IPTVApp(tk.Tk):
         ext = (self.cfg.get("replay_player") or "").strip()
         if ext:
             if self.player is not None:
-                self._request_play(None)
+                self._cancel_play_req()
+                self._vlc_call(self._vlc_stop)
             self.kill_external()
             try:
                 self.ext_proc = subprocess.Popen([ext, url])
@@ -6629,12 +6746,14 @@ class IPTVApp(tk.Tk):
         self.save_config()
         if self.player is None or not self.current_url:
             return
-        try:
-            active = self.player.get_state() in (
-                vlc.State.Opening, vlc.State.Buffering,
-                vlc.State.Playing, vlc.State.Paused)
-        except Exception:
-            active = False
+        st = self._cache.get("state")
+        active = False
+        if vlc is not None:
+            try:
+                active = st in (vlc.State.Opening, vlc.State.Buffering,
+                                vlc.State.Playing, vlc.State.Paused)
+            except Exception:
+                active = False
         if active:
             self.play_url(self.current_url, self.current_title, self.current_live)
             if not self.recording:
@@ -6645,18 +6764,16 @@ class IPTVApp(tk.Tk):
     def toggle_pause(self):
         if self.player is None:
             return
-        try:
-            st = self.player.get_state()
-        except Exception:
-            return
-        if st in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
-            return
-
-        if self._is_file_playback():
+        st = self._cache.get("state")
+        if vlc is not None:
             try:
-                self.player.pause()
+                if st in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
+                    return
             except Exception:
                 pass
+
+        if self._is_file_playback():
+            self._vlc_call(self._vlc_pause)
             return
 
         if self._net_paused:
@@ -6671,10 +6788,7 @@ class IPTVApp(tk.Tk):
             if live:
                 self._refresh_live_bar()
         else:
-            try:
-                self.player.pause()
-            except Exception:
-                pass
+            self._vlc_call(self._vlc_pause)
             self._net_paused = True
             self._flash_seek_status("已暂停（再按空格或点击画面继续）")
 
@@ -6690,7 +6804,8 @@ class IPTVApp(tk.Tk):
 
         self._net_paused = False
         if self.player is not None:
-            self._request_play(None)
+            self._cancel_play_req()
+            self._vlc_call(self._vlc_stop)
         self.kill_external()
         self._clear_replay_range()
         self.current = None
@@ -6705,36 +6820,13 @@ class IPTVApp(tk.Tk):
         try:
             if self._muted:
                 self.btn_mute.configure(text="🔇", style="Muted.TButton")
-                if self.player is not None:
-                    try:
-                        self.player.audio_set_mute(True)
-                    except Exception:
-                        pass
-                self._flash_seek_status("已静音")
             else:
                 self.btn_mute.configure(text="🔊", style="TButton")
-                if self.player is not None:
-                    try:
-                        self.player.audio_set_mute(False)
-                    except Exception:
-                        pass
-                self._flash_seek_status("已取消静音")
         except Exception:
             pass
-
-    def _apply_audio_state(self):
-        if self.player is None or getattr(self, "_closing", False):
-            return
-        try:
-            self.player.audio_set_mute(bool(self._muted))
-            self.player.audio_set_volume(
-                max(0, min(150, int(self.vol_var.get()))))
-        except Exception:
-            pass
-
-    def _schedule_audio_apply(self):
-        for ms in (300, 1000, 2500):
-            self.after(ms, self._apply_audio_state)
+        vol = max(0, min(150, int(self.vol_var.get())))
+        self._vlc_call(self._vlc_set_volume, vol, bool(self._muted))
+        self._flash_seek_status("已静音" if self._muted else "已取消静音")
 
     def on_volume(self, _v=None):
         try:
@@ -6748,17 +6840,12 @@ class IPTVApp(tk.Tk):
                 self.btn_mute.configure(text="🔊", style="TButton")
             except Exception:
                 pass
-        if self.player is not None:
-            try:
-                self.player.audio_set_mute(False)
-            except Exception:
-                pass
-            self.player.audio_set_volume(v)
         self.cfg["volume"] = v
         try:
             self.vol_pct_var.set("%d%%" % v)
         except Exception:
             pass
+        self._vlc_call(self._vlc_set_volume, v, bool(self._muted))
 
     def _apply_left_visible(self):
         if self.left_visible:
@@ -7027,16 +7114,7 @@ class IPTVApp(tk.Tk):
 
         try:
             if self.player is not None:
-                try:
-                    em = self.player.event_manager()
-                    if self._player_error_cb is not None:
-                        em.event_detach(vlc.EventType.MediaPlayerEncounteredError)
-                except Exception:
-                    pass
-                try:
-                    self.player.stop()
-                except Exception:
-                    pass
+                self._vlc_call(self._vlc_cleanup)
         except Exception:
             pass
 
@@ -7044,10 +7122,18 @@ class IPTVApp(tk.Tk):
 
     def _final_close(self):
         self._closing_after_id = None
+
         try:
-            self._vlc_lock.acquire(timeout=1.5)
+            self._vlc_q.put(None)
         except Exception:
             pass
+        if self._vlc_thread is not None:
+            try:
+                self._vlc_thread.join(timeout=2.0)
+            except Exception:
+                pass
+            self._vlc_thread = None
+
         try:
             if self.player is not None:
                 try:
