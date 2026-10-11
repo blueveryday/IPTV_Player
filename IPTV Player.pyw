@@ -17,11 +17,14 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import base64
+import gzip
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape, quoteattr
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta, timezone
 
-CODE_VERSION = "IPTV Player v2026.10.01"
+CODE_VERSION = "IPTV Player v2026.10.11"
 APP_TITLE = "IPTV Player"
 
 PY_BITS = struct.calcsize("P") * 8
@@ -291,6 +294,7 @@ def describe_vlc_problem(err):
                 "无需卸载：可以下载 %d 位的免安装组件放在程序目录里使用。" % (bits, PY_BITS, PY_BITS)) + detail
     return "找到了 VLC（%s），但加载失败，请尝试重新安装 VLC。" % VLC_MATCH_DIR + detail
 
+
 def _long_path(path):
     if not path or not sys.platform.startswith("win"):
         return path
@@ -308,10 +312,12 @@ def _long_path(path):
         pass
     return path
 
+
 def app_dir():
     if getattr(sys, "frozen", False):
         return _long_path(os.path.dirname(sys.executable))
     return _long_path(os.path.dirname(os.path.abspath(__file__)))
+
 
 APP_DIR = app_dir()
 DEFAULT_M3U = os.path.join(APP_DIR, "iptv.m3u")
@@ -547,6 +553,7 @@ def probe_audio_bitrate(ffprobe, url, use_tcp=True, timeout=10):
                 pass
     return None
 
+
 def _probe_stream_codecs(ffprobe, url, use_tcp=True, timeout=10):
     if not ffprobe:
         return None, None
@@ -577,6 +584,7 @@ def _probe_stream_codecs(ffprobe, url, use_tcp=True, timeout=10):
             a_codec = name
     return v_codec, a_codec
 
+
 def _ffprobe_full_info(ffprobe, url, use_tcp=True, timeout=15):
     if not ffprobe:
         return None
@@ -596,6 +604,7 @@ def _ffprobe_full_info(ffprobe, url, use_tcp=True, timeout=15):
         return json.loads(stdout.decode("utf-8", "replace"))
     except Exception:
         return None
+
 
 def _sniff_is_hls(url, timeout=3):
     if not url or not url.lower().startswith(("http://", "https://")):
@@ -946,6 +955,7 @@ DEFAULT_CONFIG = {
     "replay_days": 7,
     "volume": 100,
     "left_width": 200,
+    "right_width": 250,
     "epg_auto_update": True,
     "epg_start_delay": 30,
     "epg_host": "http://123.147.117.163:8081",
@@ -954,6 +964,9 @@ DEFAULT_CONFIG = {
     "epg_csv": "",
     "epg_threads": 1,
     "epg_timeout": 10,
+    "epg_sources": [],
+    "epg_update_hours": 6,
+    "epg_last_update": 0,
     "webdav_sources": [],
     "record_stop_on_switch": True,
     "sub_auto_load": True,
@@ -1086,6 +1099,39 @@ class PanelToggle(tk.Canvas):
         self.create_line(cx + gap, cy - half, cx + gap, cy + half,
                          fill=color, width=2)
 
+class VSplitter(tk.Frame):
+    def __init__(self, master, on_drag=None, on_release=None, on_press=None,
+                 width=6, **kw):
+        super().__init__(master, width=width, bg=COLORS["border"],
+                         cursor="sb_h_double_arrow", **kw)
+        self._on_drag = on_drag
+        self._on_release = on_release
+        self._on_press = on_press
+        self._active = False
+        self._last_x = 0
+        self.bind("<Button-1>", self._press)
+        self.bind("<B1-Motion>", self._motion)
+        self.bind("<ButtonRelease-1>", self._release)
+
+    def _press(self, e):
+        self._active = True
+        self._last_x = e.x_root
+        if self._on_press:
+            self._on_press()
+
+    def _motion(self, e):
+        if not self._active:
+            return
+        dx = e.x_root - self._last_x
+        self._last_x = e.x_root
+        if self._on_drag and dx:
+            self._on_drag(dx)
+
+    def _release(self, e):
+        if self._active and self._on_release:
+            self._on_release()
+        self._active = False
+
 class StatusVar(tk.StringVar):
     def __init__(self, app, **kw):
         super().__init__(app, **kw)
@@ -1100,6 +1146,7 @@ class StatusVar(tk.StringVar):
             self._app._on_status_set()
         except Exception:
             pass
+
 
 def read_text_auto(path):
     raw = open(path, "rb").read()
@@ -1263,6 +1310,7 @@ def scan_local_m3u_files():
             continue
         files.append((name, p))
     return files
+
 
 class WebDAVClient:
     def __init__(self, url, user="", password="", timeout=15):
@@ -1430,90 +1478,279 @@ EPG_TOOL_DIR = os.path.join(APP_DIR, "src")
 EPG_DIR = os.path.join(EPG_TOOL_DIR, "epg")
 EPG_CSV = os.path.join(EPG_TOOL_DIR, "channel_epg_chongqing.csv")
 EPG_MISS_FILE = os.path.join(EPG_DIR, ".miss.json")
+EPG_ALIAS_FILE = os.path.join(EPG_DIR, "alias.json")
+EPG_SOURCES_FILE = os.path.join(EPG_DIR, "epg_sources.json")
 EPG_URL = "http://123.147.117.163:8081/resource/schedules_v2/{channelcode}_{date}.json"
 EPG_TIMEOUT = 10
 EPG_RETRY = 2
 EPG_THREADS = 1
 EPG_MISS_TTL = 6 * 3600
-EPG_FILE_RE = re.compile(r"_(\d{8})\.json$", re.I)
-_epg_cache = {}
+
+EPG_XML = os.path.join(EPG_DIR, "iptv_epg.xml")
+EPG_EXT_MAP = os.path.join(EPG_DIR, ".ext_map.json")
+EPG_RESERVED = {"iptv_epg.xml"}
+EPG_TZ_HOURS = 8
+_epg_xml_cache = {
+    "sig": None, "progs": {}, "names": {}, "labels": [],
+    "label_sources": {}, "files": [],
+}
+EPG_ALIAS = {}
+
+
+def set_epg_alias(d):
+    global EPG_ALIAS
+    EPG_ALIAS = dict(d or {})
+    _epg_xml_cache["sig"] = None
+
+
+def load_epg_alias_file():
+    try:
+        with open(EPG_ALIAS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_epg_alias_file(d):
+    try:
+        os.makedirs(EPG_DIR, exist_ok=True)
+        with open(EPG_ALIAS_FILE, "w", encoding="utf-8") as f:
+            json.dump(d or {}, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+def load_epg_sources_file():
+    try:
+        with open(EPG_SOURCES_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, list) else []
+    except Exception:
+        return []
+
+
+def save_epg_sources_file(lst):
+    try:
+        os.makedirs(EPG_DIR, exist_ok=True)
+        with open(EPG_SOURCES_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(lst or []), f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+def set_epg_tz(h):
+    global EPG_TZ_HOURS
+    try:
+        EPG_TZ_HOURS = int(h)
+    except Exception:
+        EPG_TZ_HOURS = 8
+    _epg_xml_cache["sig"] = None
 
 
 def _norm_name(s):
-    return re.sub(r'[\\/:*?"<>|_\s]+', "", s or "").lower()
+    return re.sub(r'[\\/:*?"<>|_\s\-]+', "", s or "").lower()
 
 
-def find_epg_dir(name):
-    if not os.path.isdir(EPG_DIR):
+def _parse_xmltv_time(s, local_off):
+    m = re.match(r"^(\d{8})(\d{0,6})\s*(?:([+-])(\d{2}):?(\d{2}))?", (s or "").strip())
+    if not m:
         return None
-    p = os.path.join(EPG_DIR, name)
-    if os.path.isdir(p):
-        return p
-    key = _norm_name(name)
     try:
-        for d in os.listdir(EPG_DIR):
-            fp = os.path.join(EPG_DIR, d)
-            if os.path.isdir(fp) and _norm_name(d) == key:
-                return fp
+        dt = datetime.strptime(m.group(1) + m.group(2).ljust(6, "0"),
+                               "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    if m.group(3):
+        off = int(m.group(4)) * 60 + int(m.group(5))
+        if m.group(3) == "-":
+            off = -off
+        dt = dt - timedelta(minutes=off) + timedelta(hours=local_off)
+    return dt
+
+
+def _epg_ext_files():
+    try:
+        names = [f for f in os.listdir(EPG_DIR)
+                 if f.lower().endswith(".xml") and f.lower() not in EPG_RESERVED]
     except OSError:
-        pass
-    return None
+        return []
+    return [os.path.join(EPG_DIR, f) for f in sorted(names)]
 
 
-def _parse_epg_file(path):
-    items = []
+def _open_epg_file(path):
+    with open(path, "rb") as f:
+        magic = f.read(2)
+    return gzip.open(path, "rb") if magic == b"\x1f\x8b" else open(path, "rb")
+
+
+def _parse_epg_xml_file(path, prefix):
+    progs, names, labels = {}, {}, set()
+    fobj = None
     try:
-        data = json.loads(read_text_auto(path))
+        fobj = _open_epg_file(path)
+        for _ev, el in ET.iterparse(fobj, events=("end",)):
+            if el.tag == "channel":
+                cid = (el.get("id") or "").strip()
+                if cid:
+                    keys = {_norm_name(cid)}
+                    dns = []
+                    for d in el.findall("display-name"):
+                        if d.text and d.text.strip():
+                            nm = d.text.strip()
+                            dns.append(nm)
+                            keys.add(_norm_name(nm))
+                    for k in keys:
+                        if k:
+                            names.setdefault(k, set()).add(prefix + cid)
+                    labels.update(dns or [cid])
+                el.clear()
+            elif el.tag == "programme":
+                st = _parse_xmltv_time(el.get("start"), EPG_TZ_HOURS)
+                et = _parse_xmltv_time(el.get("stop"), EPG_TZ_HOURS)
+                if st and et and et > st:
+                    t = el.find("title")
+                    title = ((t.text or "") if t is not None else "").strip()
+                    cid = (el.get("channel") or "").strip()
+                    progs.setdefault(prefix + cid, []).append((st, et, title))
+                el.clear()
     except Exception:
-        return items
-    fmt = "%Y-%m-%d %H:%M:%S"
-    for s in (data.get("schedules") or []):
+        pass
+    finally:
         try:
-            st = datetime.strptime(s["starttime"], fmt)
-            et = datetime.strptime(s["endtime"], fmt)
+            if fobj:
+                fobj.close()
         except Exception:
-            continue
-        if et <= st:
-            continue
-        items.append({"title": str(s.get("title") or "").strip(),
-                      "start": st, "end": et})
-    return items
+            pass
+    return progs, names, labels
 
 
-def load_epg(channel_name, day):
-    d = find_epg_dir(channel_name)
-    if not d:
-        return []
-    suffix = "_%s.json" % day.strftime("%Y%m%d")
-    try:
-        files = [f for f in os.listdir(d) if f.lower().endswith(suffix)]
-    except OSError:
-        return []
-    progs = []
-    for f in files:
-        path = os.path.join(d, f)
+def _id_file_stem(cid, files):
+    if not cid:
+        return None
+    m = re.match(r"^(\d+):", cid)
+    if m:
+        idx = int(m.group(1))
+        if 0 <= idx < len(files):
+            stem = os.path.splitext(os.path.basename(files[idx]))[0]
+            return stem or None
+        return None
+    return "iptv_epg"
+
+
+def _get_epg_xml_index():
+    files = ([EPG_XML] if os.path.isfile(EPG_XML) else []) + _epg_ext_files()
+    sig = [EPG_TZ_HOURS]
+    for p in files:
         try:
-            mtime = os.path.getmtime(path)
+            s = os.stat(p)
+            sig.append((p, s.st_mtime, s.st_size))
         except OSError:
-            continue
-        hit = _epg_cache.get(path)
-        if hit and hit[0] == mtime:
-            items = hit[1]
-        else:
-            items = _parse_epg_file(path)
-            _epg_cache[path] = (mtime, items)
-        progs.extend(items)
+            pass
+    sig = tuple(sig)
+    c = _epg_xml_cache
+    if c["sig"] == sig:
+        return c["progs"], c["names"]
+
+    progs, names, labels = {}, {}, set()
+    label_sources = {}
+    primary_keys = set()
+    for i, p in enumerate(files):
+        is_primary = (p == EPG_XML)
+        stem = os.path.splitext(os.path.basename(p))[0] or ("iptv_epg" if is_primary else "epg")
+        fp, fn, fl = _parse_epg_xml_file(p, "" if is_primary else "%d:" % i)
+        for lb in fl:
+            label_sources.setdefault(lb, set()).add(stem)
+        labels |= fl
+        if is_primary:
+            primary_keys = set(fn)
+        elif primary_keys:
+            drop = set()
+            for k, ids in fn.items():
+                if k in primary_keys:
+                    drop |= ids
+            if drop:
+                fp = {cid: v for cid, v in fp.items() if cid not in drop}
+                fn = {k: ids - drop for k, ids in fn.items()}
+                fn = {k: ids for k, ids in fn.items() if ids}
+        progs.update(fp)
+        for k, ids in fn.items():
+            names.setdefault(k, set()).update(ids)
+    c.update(sig=sig, progs=progs, names=names,
+             labels=sorted(labels, key=lambda x: (_norm_name(x), x)),
+             label_sources=label_sources, files=files)
+    return progs, names
+
+
+def _split_alias_value(alias_val):
+    if not alias_val:
+        return alias_val, None
+    files = _epg_xml_cache.get("files") or []
+    stems = set()
+    for p in files:
+        stem = os.path.splitext(os.path.basename(p))[0]
+        if stem:
+            stems.add(stem)
+    for stem in sorted(stems, key=len, reverse=True):
+        suffix = "_" + stem
+        if alias_val.endswith(suffix) and len(alias_val) > len(suffix):
+            return alias_val[:-len(suffix)], stem
+    return alias_val, None
+
+
+def _resolve_alias_ids(alias_val, names):
+    if not alias_val:
+        return None
+    base, stem_hint = _split_alias_value(alias_val)
+    ids = names.get(_norm_name(base))
+    if not ids:
+        ids = names.get(_norm_name(alias_val))
+    if not ids:
+        return None
+    if stem_hint:
+        files = _epg_xml_cache.get("files") or []
+        filtered = {cid for cid in ids if _id_file_stem(cid, files) == stem_hint}
+        if filtered:
+            return filtered
+    return ids
+
+
+def load_epg(channel_name, day, url=None):
+    progs, names = _get_epg_xml_index()
+    ids = None
+    prefer_primary = bool(url and "5140/rtsp/" in url)
+
+    if prefer_primary:
+        all_ids = names.get(_norm_name(channel_name))
+        if all_ids:
+            files = _epg_xml_cache.get("files") or []
+            primary = {cid for cid in all_ids
+                       if _id_file_stem(cid, files) == "iptv_epg"}
+            if primary:
+                ids = primary
+        if not ids:
+            ids = _resolve_alias_ids(EPG_ALIAS.get(channel_name), names)
+    else:
+        ids = _resolve_alias_ids(EPG_ALIAS.get(channel_name), names)
+        if not ids:
+            ids = names.get(_norm_name(channel_name))
+
+    if not ids:
+        return []
+    rows = []
+    for cid in ids:
+        rows.extend(progs.get(cid, ()))
     day_start = datetime(day.year, day.month, day.day)
     day_end = day_start + timedelta(days=1)
     seen, result = set(), []
-    for p in sorted(progs, key=lambda x: x["start"]):
-        if not (p["start"] < day_end and p["end"] > day_start):
+    for st, et, title in sorted(rows):
+        if not (st < day_end and et > day_start):
             continue
-        k = (p["start"], p["end"], p["title"])
+        k = (st, et, title)
         if k in seen:
             continue
         seen.add(k)
-        result.append(p)
+        result.append({"title": title, "start": st, "end": et})
     return result
 
 
@@ -1545,15 +1782,12 @@ def epg_csv_path(cfg):
 
 
 def epg_clear_all():
+    keep = load_epg_sources_file()
     if os.path.isdir(EPG_DIR):
         shutil.rmtree(EPG_DIR, ignore_errors=True)
-    _epg_cache.clear()
-
-
-def epg_folder_name(name):
-    name = re.sub(r'[\\/:*?"<>|]', "_", name or "").strip().rstrip(".")
-    return name or "_"
-
+    if keep:
+        save_epg_sources_file(keep)
+    _epg_xml_cache["sig"] = None
 
 def load_epg_channels(csv_path):
     items, seen = [], set()
@@ -1613,97 +1847,321 @@ def _epg_fetch(url, timeout=EPG_TIMEOUT):
     return "error", None
 
 
-def epg_cleanup(valid_dates):
-    removed = 0
+def _fmt_tz(h):
+    h = int(h)
+    return "%s%02d00" % ("+" if h >= 0 else "-", abs(h))
+
+
+def _parse_epg_data(data):
+    items = []
+    if not isinstance(data, dict):
+        return items
+    fmt = "%Y-%m-%d %H:%M:%S"
+    for s in (data.get("schedules") or []):
+        try:
+            st = datetime.strptime(s["starttime"], fmt)
+            et = datetime.strptime(s["endtime"], fmt)
+        except Exception:
+            continue
+        if et <= st:
+            continue
+        items.append((st, et, str(s.get("title") or "").strip()))
+    return items
+
+
+def _prog_key(item, tz_s):
+    st, et, title = item
+    return (st.strftime("%Y%m%d%H%M%S") + " " + tz_s,
+            et.strftime("%Y%m%d%H%M%S") + " " + tz_s, title)
+
+
+def _prog_date(st_s, tz):
+    st = _parse_xmltv_time(st_s, tz)
+    return st.strftime("%Y%m%d") if st else None
+
+
+def _read_primary_xml():
+    progs, names = {}, {}
+    if not os.path.isfile(EPG_XML):
+        return progs, names
+    try:
+        for _ev, el in ET.iterparse(EPG_XML, events=("end",)):
+            if el.tag == "channel":
+                cid = (el.get("id") or "").strip()
+                if cid:
+                    names[cid] = [d.text.strip() for d in el.findall("display-name")
+                                  if d.text and d.text.strip()]
+                el.clear()
+            elif el.tag == "programme":
+                cid = (el.get("channel") or "").strip()
+                if cid and el.get("start") and el.get("stop"):
+                    t = el.find("title")
+                    title = ((t.text or "") if t is not None else "").strip()
+                    progs.setdefault(cid, set()).add(
+                        (el.get("start"), el.get("stop"), title))
+                el.clear()
+    except Exception:
+        pass
+    return progs, names
+
+
+def _import_legacy_json(progs, names, code2title, tz_s):
+    found = False
     if not os.path.isdir(EPG_DIR):
-        return 0
-    keep = set(valid_dates)
+        return found
     for sub in os.listdir(EPG_DIR):
         sp = os.path.join(EPG_DIR, sub)
         if not os.path.isdir(sp):
             continue
-        for f in os.listdir(sp):
-            fp = os.path.join(sp, f)
-            m = EPG_FILE_RE.search(f)
-            stale = (m and m.group(1) not in keep) or f.lower().endswith(".json.tmp")
-            if stale:
-                try:
-                    os.remove(fp)
-                    removed += 1
-                    _epg_cache.pop(fp, None)
-                except OSError:
-                    pass
+        for fn in os.listdir(sp):
+            m = re.match(r"^(.+)_(\d{8})\.json$", fn, re.I)
+            if not m:
+                continue
+            code = m.group(1)
+            try:
+                items = _parse_epg_data(json.loads(read_text_auto(os.path.join(sp, fn))))
+            except Exception:
+                continue
+            if items:
+                found = True
+                names.setdefault(code, [code2title.get(code) or sub])
+                ks = progs.setdefault(code, set())
+                for it in items:
+                    ks.add(_prog_key(it, tz_s))
+        shutil.rmtree(sp, ignore_errors=True)
+    return found
+
+
+def _write_primary_xml(progs, names):
+    tmp = EPG_XML + ".tmp"
+    count = 0
+    with open(tmp, "w", encoding="utf-8", newline="\n") as out:
+        out.write('<?xml version="1.0" encoding="UTF-8"?>\n'
+                  '<tv generator-info-name=%s>\n' % quoteattr(CODE_VERSION))
+        ids = sorted(c for c in progs if progs[c])
+        for cid in ids:
+            out.write("<channel id=%s>" % quoteattr(cid))
+            for nm in (names.get(cid) or [cid]):
+                out.write("<display-name>%s</display-name>" % escape(nm))
+            out.write("</channel>\n")
+        for cid in ids:
+            for st_s, et_s, title in sorted(progs[cid]):
+                out.write('<programme start=%s stop=%s channel=%s>'
+                          '<title lang="zh">%s</title></programme>\n'
+                          % (quoteattr(st_s), quoteattr(et_s),
+                             quoteattr(cid), escape(title)))
+                count += 1
+        out.write("</tv>\n")
+    os.replace(tmp, EPG_XML)
+    return count
+
+
+def _ext_stem_from_url(src):
+    if src.lower().startswith(("http://", "https://")):
+        p = urllib.parse.urlsplit(src).path
+    else:
+        p = src
+    base = os.path.basename(p.replace("\\", "/")) or "epg"
+    for suf in (".gz", ".xml"):
+        if base.lower().endswith(suf):
+            base = base[:-len(suf)]
+    return safe_filename(base, 60) or "epg"
+
+
+def _load_ext_map():
+    try:
+        with open(EPG_EXT_MAP, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _assign_ext_names(sources, old_map):
+    used = {"iptv_epg", "alias"}
+    new = {}
+    for src in sources:
+        stem = old_map.get(src)
+        if stem and stem.lower() not in used:
+            used.add(stem.lower())
+            new[src] = stem
+    for src in sources:
+        if src in new:
+            continue
+        base = _ext_stem_from_url(src)
+        stem, i = base, 1
+        while (stem.lower() in used
+               or os.path.exists(os.path.join(EPG_DIR, stem + ".xml"))):
+            i += 1
+            stem = "%s_%d" % (base, i)
+        used.add(stem.lower())
+        new[src] = stem
+    return new
+
+
+def _copy_convert_xml(fi, fo):
+    import codecs
+    head = fi.read(16384)
+    if b"<tv" not in head.lower():
+        raise ValueError("不是 XMLTV 内容")
+    dec = codecs.getincrementaldecoder("utf-8")()
+    try:
+        first, chunk = True, head
+        while chunk:
+            text = dec.decode(chunk)
+            if first:
+                text = text.lstrip("\ufeff")
+                text = re.sub(r'(<\?xml[^>]*?encoding=)["\'][^"\']*["\']',
+                              r'\1"UTF-8"', text, count=1)
+                first = False
+            fo.write(text.encode("utf-8"))
+            chunk = fi.read(1 << 20)
+        fo.write(dec.decode(b"", True).encode("utf-8"))
+    except UnicodeDecodeError:
+        fi.seek(0)
+        fo.seek(0)
+        fo.truncate()
+        shutil.copyfileobj(fi, fo)
+
+
+def epg_download_ext(state):
+    os.makedirs(EPG_DIR, exist_ok=True)
+    sources = list(dict.fromkeys(state["sources"]))
+    old_map = _load_ext_map()
+    new_map = _assign_ext_names(sources, old_map)
+
+    for src, stem in old_map.items():
+        if src not in new_map:
+            try:
+                os.remove(os.path.join(EPG_DIR, stem + ".xml"))
+            except OSError:
+                pass
+    try:
+        with open(EPG_EXT_MAP, "w", encoding="utf-8") as f:
+            json.dump(new_map, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+    for src in sources:
+        if state["cancel"]:
+            break
+        stem = new_map[src]
+        part = os.path.join(EPG_DIR, stem + ".part")
+        outp = os.path.join(EPG_DIR, stem + ".xml.tmp")
+        final = os.path.join(EPG_DIR, stem + ".xml")
         try:
-            os.rmdir(sp)
-        except OSError:
-            pass
-    return removed
+            if src.lower().startswith(("http://", "https://")):
+                req = urllib.request.Request(
+                    src, headers={"User-Agent": "Mozilla/5.0 (IPTVPlayer)"})
+                with urllib.request.urlopen(req, timeout=max(state["timeout"], 30)) as r, \
+                        open(part, "wb") as f:
+                    shutil.copyfileobj(r, f)
+            else:
+                shutil.copyfile(src, part)
+            with open(part, "rb") as f:
+                is_gz = f.read(2) == b"\x1f\x8b"
+            with (gzip.open(part, "rb") if is_gz else open(part, "rb")) as fi, \
+                    open(outp, "wb") as fo:
+                _copy_convert_xml(fi, fo)
+            os.replace(outp, final)
+            state["src_ok"] += 1
+        except Exception:
+            state["src_fail"] += 1
+            try:
+                if os.path.isfile(outp):
+                    os.remove(outp)
+            except OSError:
+                pass
+        finally:
+            try:
+                if os.path.isfile(part):
+                    os.remove(part)
+            except OSError:
+                pass
 
 
 def epg_update_worker(state, today, n, force_dates):
     try:
+        tz = state["tz"]
+        tz_s = _fmt_tz(tz)
         dates = epg_valid_dates(today, n)
-        state["removed"] = epg_cleanup(dates)
+        win_start = datetime(today.year, today.month, today.day) - timedelta(days=n - 1)
+        os.makedirs(EPG_DIR, exist_ok=True)
+
+        old_xml = os.path.join(APP_DIR, "iptv_epg.xml")
+        if os.path.isfile(old_xml):
+            if os.path.isfile(EPG_XML):
+                os.remove(old_xml)
+            else:
+                os.replace(old_xml, EPG_XML)
 
         csv_path = state["csv"]
-        if not os.path.isfile(csv_path):
+        channels = []
+        if os.path.isfile(csv_path):
+            channels = load_epg_channels(csv_path)
+        elif not state["sources"]:
             state["error"] = "未找到频道表：%s" % csv_path
             return
-        channels = load_epg_channels(csv_path)
+        code2title = dict(channels)
+
+        progs, names = _read_primary_xml()
+        changed = _import_legacy_json(progs, names, code2title, tz_s)
+
+        removed = 0
+        for code in list(progs):
+            keep = set()
+            for k in progs[code]:
+                et = _parse_xmltv_time(k[1], tz)
+                if et and et > win_start:
+                    keep.add(k)
+                else:
+                    removed += 1
+            progs[code] = keep
+        state["removed"] = removed
+
+        covered = {}
+        for code, ks in progs.items():
+            covered[code] = {d for d in (_prog_date(k[0], tz) for k in ks) if d}
 
         miss = _load_miss()
         now_ts = time.time()
         jobs = []
-        listed = {}
         for code, title in channels:
-            folder = os.path.join(EPG_DIR, epg_folder_name(title))
-            if folder not in listed:
-                try:
-                    listed[folder] = set(os.listdir(folder))
-                except OSError:
-                    listed[folder] = set()
-            have = listed[folder]
             for d in dates:
-                fn = "%s_%s.json" % (code, d)
-                fp = os.path.join(folder, fn)
                 if d not in force_dates:
-                    if fn in have:
+                    if d in covered.get(code, ()):
                         continue
                     if now_ts - miss.get("%s_%s" % (code, d), 0) < EPG_MISS_TTL:
                         continue
-                jobs.append((code, d, folder, fp))
+                jobs.append((code, d))
         state["total"] = len(jobs)
 
         lock = threading.Lock()
+        results = {}
         q = queue.Queue()
         for j in jobs:
             q.put(j)
 
         def run(job):
-            code, d, folder, fp = job
+            code, d = job
             key = "%s_%s" % (code, d)
-            status = "error"
+            items = None
             try:
                 status, body = _epg_fetch(state["url_fn"](code, d), state["timeout"])
                 if status == "ok":
                     try:
-                        data = json.loads(body.decode("utf-8-sig"))
-                        if not (isinstance(data, dict) and data.get("schedules")):
+                        items = _parse_epg_data(json.loads(body.decode("utf-8-sig")))
+                        if not items:
                             status = "nodata"
                     except Exception:
                         status = "error"
-                if status == "ok":
-                    os.makedirs(folder, exist_ok=True)
-                    tmp = fp + ".tmp"
-                    with open(tmp, "wb") as f:
-                        f.write(body)
-                    os.replace(tmp, fp)
             except Exception:
                 status = "error"
             with lock:
                 if status == "ok":
                     state["ok"] += 1
                     miss.pop(key, None)
+                    results[job] = items
                 elif status == "nodata":
                     state["nodata"] += 1
                     miss[key] = time.time()
@@ -1726,8 +2184,34 @@ def epg_update_worker(state, today, n, force_dates):
         for t in ths:
             t.join()
 
-        keep = set(dates)
-        _save_miss({k: v for k, v in miss.items() if k.rsplit("_", 1)[-1] in keep})
+        keep_d = set(dates)
+        _save_miss({k: v for k, v in miss.items() if k.rsplit("_", 1)[-1] in keep_d})
+
+        for (code, d), items in results.items():
+            ks = progs.setdefault(code, set())
+            for k in [k for k in ks if _prog_date(k[0], tz) == d]:
+                ks.discard(k)
+            for it in items:
+                ks.add(_prog_key(it, tz_s))
+            changed = True
+
+        for code in progs:
+            if code in code2title:
+                names[code] = [code2title[code]]
+            elif not names.get(code):
+                names[code] = [code]
+
+        state["xml_count"] = sum(len(v) for v in progs.values())
+        if (changed or removed or not os.path.isfile(EPG_XML)) \
+                and (state["xml_count"] or os.path.isfile(EPG_XML)) \
+                and not state["cancel"]:
+            state["xml_count"] = _write_primary_xml(progs, names)
+            state["built"] = True
+
+        if not state["cancel"]:
+            epg_download_ext(state)
+            if state["src_ok"] > 0:
+                state["built"] = True
     except Exception as e:
         state["error"] = str(e)
     finally:
@@ -1822,6 +2306,12 @@ class IPTVApp(tk.Tk):
 
         self._snapshot_pending = []
 
+        self._left_drag_w = 0
+        self._right_drag_w = 0
+
+        self._epg_color_set = None
+        self._epg_color_loading = False
+
         self._setup_ttk_style()
         self.build_menu()
         self.build_ui()
@@ -1832,6 +2322,7 @@ class IPTVApp(tk.Tk):
         self.after(500, self._update_progress)
         self.after(max(1, int(self.cfg.get("epg_start_delay", 30))) * 1000,
                    self.auto_epg_update)
+        self.after(400, self._start_epg_color_load)
 
     def _setup_ttk_style(self):
         style = ttk.Style(self)
@@ -1990,18 +2481,42 @@ class IPTVApp(tk.Tk):
         except Exception:
             self.cfg["left_width"] = 200
         try:
-            self.cfg["volume"] = max(0, min(125, int(self.cfg.get("volume", 100))))
+            self.cfg["right_width"] = int(self.cfg.get("right_width", 300))
+        except Exception:
+            self.cfg["right_width"] = 300
+        try:
+            self.cfg["volume"] = max(0, min(150, int(self.cfg.get("volume", 100))))
         except Exception:
             self.cfg["volume"] = 100
         if not isinstance(self.cfg.get("webdav_sources"), list):
             self.cfg["webdav_sources"] = []
         if "record_stop_on_switch" not in self.cfg:
             self.cfg["record_stop_on_switch"] = True
+        sources = load_epg_sources_file()
+        old_sources = self.cfg.get("epg_sources")
+        if not sources and isinstance(old_sources, list) and old_sources:
+            sources = list(old_sources)
+            save_epg_sources_file(sources)
+        if not isinstance(sources, list):
+            sources = []
+        self.cfg["epg_sources"] = sources
+        set_epg_tz(self.cfg.get("tz_offset", 8))
+
+        alias = load_epg_alias_file()
+        old = self.cfg.get("epg_alias")
+        if isinstance(old, dict) and old:
+            for k, v in old.items():
+                alias.setdefault(k, v)
+            save_epg_alias_file(alias)
+        self.cfg.pop("epg_alias", None)
+        set_epg_alias(alias)
 
     def save_config(self):
         try:
+            cfg_copy = dict(self.cfg)
+            cfg_copy.pop("epg_sources", None)
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.cfg, f, ensure_ascii=False, indent=2)
+                json.dump(cfg_copy, f, ensure_ascii=False, indent=2)
         except Exception as e:
             messagebox.showerror("错误", "保存配置失败：%s" % e)
 
@@ -2073,6 +2588,9 @@ class IPTVApp(tk.Tk):
         em.add_separator()
         em.add_command(label="下载 EPG", command=self.manual_epg_update)
         em.add_command(label="自定义 EPG 下载参数...", command=self.open_epg_settings)
+        em.add_command(label="设置 EPG 网络源...", command=self.open_epg_sources)
+        em.add_separator()
+        em.add_command(label="频道别名...", command=self.open_epg_alias)
         em.add_separator()
         em.add_command(label="打开截图目录", command=self.open_screenshot_dir)
         menubar.add_cascade(label="选项", menu=em)
@@ -2188,12 +2706,14 @@ class IPTVApp(tk.Tk):
 
     def build_ui(self):
         self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(1, weight=1)
+        self.grid_columnconfigure(2, weight=1)
         self.left_visible = True
         self.right_visible = bool(self.cfg.get("right_visible", False))
 
         _raw_left = int(self.cfg.get("left_width", 200))
-        left_w = max(200, min(600, int(_raw_left * 1)))
+        left_w = max(180, min(900, int(_raw_left)))
+        _raw_right = int(self.cfg.get("right_width", 300))
+        right_w = max(180, min(900, _raw_right))
 
         left_holder = ttk.Frame(self, style="Panel.TFrame")
         left_holder.grid(row=0, column=0, sticky="ns")
@@ -2264,8 +2784,14 @@ class IPTVApp(tk.Tk):
         ttk.Label(self.left_body, textvariable=self.count_var,
                   style="Dim.TLabel").pack(anchor="w", padx=10, pady=(2, 8))
 
+        self.left_splitter = VSplitter(self,
+                                       on_drag=self._on_left_split_drag,
+                                       on_release=self._on_split_release,
+                                       on_press=self._on_left_split_press,
+                                       width=6)
+
         mid = ttk.Frame(self)
-        mid.grid(row=0, column=1, sticky="nsew")
+        mid.grid(row=0, column=2, sticky="nsew")
         self.mid_panel = mid
         mid.grid_rowconfigure(0, weight=1)
         mid.grid_columnconfigure(0, weight=1)
@@ -2318,7 +2844,7 @@ class IPTVApp(tk.Tk):
                                    command=self.toggle_mute)
         self.btn_mute.pack(side=tk.LEFT, padx=2)
         self.vol_var = tk.IntVar(value=int(self.cfg.get("volume", 100)))
-        ttk.Scale(ctl, from_=0, to=125, variable=self.vol_var, length=125,
+        ttk.Scale(ctl, from_=0, to=150, variable=self.vol_var, length=100,
                   command=self.on_volume).pack(side=tk.LEFT, padx=2)
         self.vol_pct_var = tk.StringVar(value="%d%%" % self.vol_var.get())
         self.vol_pct_label = ttk.Label(ctl, textvariable=self.vol_pct_var, width=5,
@@ -2338,13 +2864,21 @@ class IPTVApp(tk.Tk):
                                    style="Rec.TLabel", anchor="e")
         self.rec_label.grid(row=0, column=1, sticky="e")
 
+        self.right_splitter = VSplitter(self,
+                                        on_drag=self._on_right_split_drag,
+                                        on_release=self._on_split_release,
+                                        on_press=self._on_right_split_press,
+                                        width=6)
+
         right_holder = ttk.Frame(self, style="Panel.TFrame")
-        right_holder.grid(row=0, column=2, sticky="ns")
+        right_holder.grid(row=0, column=4, sticky="ns")
         right_holder.grid_rowconfigure(0, weight=1)
         self.right_holder = right_holder
 
-        right = ttk.Frame(right_holder, style="Panel.TFrame")
+        right = ttk.Frame(right_holder, width=right_w, style="Panel.TFrame")
         right.grid(row=0, column=0, sticky="ns")
+        right.grid_propagate(False)
+        right.pack_propagate(False)
         right.grid_rowconfigure(0, weight=1)
         right.grid_columnconfigure(0, weight=1)
         self.right_panel = right
@@ -2372,7 +2906,7 @@ class IPTVApp(tk.Tk):
 
         df = ttk.Frame(self.right_body, style="Panel.TFrame")
         df.pack(fill=tk.X, padx=8, pady=4)
-        ttk.Label(df, text="回看", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(df, text="EPG", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 4))
         self.date_var = tk.StringVar()
         self.date_cb = ttk.Combobox(df, textvariable=self.date_var, width=16,
                                     values=self.date_choices(), state="readonly")
@@ -2447,6 +2981,62 @@ class IPTVApp(tk.Tk):
         self.bind("<Down>", self._on_arrow_down)
 
         self.refresh_slots()
+
+    LEFT_COLLAPSE_THRESHOLD = 100
+    LEFT_MIN_WIDTH = 180
+    RIGHT_COLLAPSE_THRESHOLD = 100
+    RIGHT_MIN_WIDTH = 180
+    PANEL_MAX_WIDTH = 360
+
+    def _on_left_split_press(self):
+        if self.left_visible:
+            self._left_drag_w = int(self.cfg.get("left_width", 200))
+        else:
+            self._left_drag_w = 0
+
+    def _on_left_split_drag(self, dx):
+        self._left_drag_w += dx
+        if self._left_drag_w < self.LEFT_COLLAPSE_THRESHOLD:
+            self._left_drag_w = max(0, self._left_drag_w)
+            if self.left_visible:
+                self.left_visible = False
+                self._apply_left_visible()
+        else:
+            w = max(self.LEFT_MIN_WIDTH,
+                    min(self.PANEL_MAX_WIDTH, self._left_drag_w))
+            self.cfg["left_width"] = w
+            if not self.left_visible:
+                self.left_visible = True
+            self.left_panel.configure(width=w)
+            self._apply_left_visible()
+
+    def _on_right_split_press(self):
+        if self.right_visible:
+            self._right_drag_w = int(self.cfg.get("right_width", 300))
+        else:
+            self._right_drag_w = 0
+
+    def _on_right_split_drag(self, dx):
+        self._right_drag_w -= dx
+        if self._right_drag_w < self.RIGHT_COLLAPSE_THRESHOLD:
+            self._right_drag_w = max(0, self._right_drag_w)
+            if self.right_visible:
+                self.right_visible = False
+                self._apply_right_visible()
+        else:
+            w = max(self.RIGHT_MIN_WIDTH,
+                    min(self.PANEL_MAX_WIDTH, self._right_drag_w))
+            self.cfg["right_width"] = w
+            if not self.right_visible:
+                self.right_visible = True
+            self.right_panel.configure(width=w)
+            self._apply_right_visible()
+
+    def _on_split_release(self):
+        try:
+            self.save_config()
+        except Exception:
+            pass
 
     def _record_display_name(self):
         raw = ""
@@ -3087,12 +3677,13 @@ class IPTVApp(tk.Tk):
         self._flash_seek_status("已前进至 %s 回看" % new_time.strftime("%H:%M:%S"))
 
     def _find_epg_bounds_for_now(self, ch, now):
-        progs = load_epg(ch["name"], now.date())
+        progs = load_epg(ch["name"], now.date(), ch.get("url"))
         for p in progs:
             if p["start"] <= now < p["end"]:
                 return p["start"], p["end"]
         if now.hour < 6:
-            for p in load_epg(ch["name"], (now - timedelta(days=1)).date()):
+            for p in load_epg(ch["name"], (now - timedelta(days=1)).date(),
+                              ch.get("url")):
                 if p["start"] <= now < p["end"]:
                     return p["start"], p["end"]
         past = [p for p in progs if p["end"] <= now]
@@ -3104,6 +3695,9 @@ class IPTVApp(tk.Tk):
     def _live_rewind_start(self):
         ch = self.current
         if not ch:
+            return
+        if not replay_supported(ch["url"], self.cfg):
+            self.status_var.set("该频道不支持回看，无法倒退")
             return
         now = self.local_now()
         if self.replay_range_start is None:
@@ -4132,6 +4726,13 @@ class IPTVApp(tk.Tk):
                 except Exception:
                     pass
                 return
+            if not replay_supported(ch["url"], self.cfg):
+                self.status_var.set("该频道不支持回看，无法拖动进度")
+                try:
+                    self.seek_bar.set_value(1000)
+                except Exception:
+                    pass
+                return
             now = self.local_now()
             bounds = self._find_epg_bounds_for_now(ch, now)
             if bounds is None:
@@ -4223,7 +4824,7 @@ class IPTVApp(tk.Tk):
             return None
 
     def build_day_slots(self, ch, day_date):
-        progs = load_epg(ch["name"], day_date) if ch else []
+        progs = load_epg(ch["name"], day_date, ch.get("url")) if ch else []
         if progs:
             return [("%s  %s" % (fmt_range(p["start"], p["end"]), p["title"]),
                      p["start"], p["end"]) for p in progs], True
@@ -4236,11 +4837,274 @@ class IPTVApp(tk.Tk):
         return slots, False
 
     def auto_epg_update(self):
-        if self.cfg.get("epg_auto_update", True):
-            self.start_epg_update(silent=True)
+        if getattr(self, "_closing", False):
+            return
+        try:
+            hours = float(self.cfg.get("epg_update_hours", 12))
+        except Exception:
+            hours = 12.0
+        if self.cfg.get("epg_auto_update", True) and hours > 0:
+            last = float(self.cfg.get("epg_last_update", 0) or 0)
+            st = self.epg_state
+            busy = bool(st and not st["finished"])
+            if not busy and time.time() - last >= hours * 3600:
+                self.start_epg_update(silent=True)
+        self.after(600000, self.auto_epg_update)
 
     def manual_epg_update(self):
         self.start_epg_update(silent=False)
+
+    def open_epg_alias(self):
+        progs, names = _get_epg_xml_index()
+        labels = list(_epg_xml_cache.get("labels") or [])
+        label_sources = _epg_xml_cache.get("label_sources") or {}
+        if not labels:
+            messagebox.showinfo("提示", "还没有 EPG 数据，请先通过 选项→下载 EPG 获取。")
+            return
+        chans = []
+        for c in self.channels:
+            nm = c.get("name")
+            if nm and not c.get("local") and nm not in chans:
+                chans.append(nm)
+        if not chans:
+            messagebox.showinfo("提示", "左侧频道列表为空，请先加载 m3u。")
+            return
+        alias = dict(EPG_ALIAS)
+
+        candidates = []
+        for lb in labels:
+            srcs = sorted(label_sources.get(lb, ()))
+            if not srcs:
+                candidates.append(lb)
+            else:
+                for src in srcs:
+                    candidates.append("%s_%s" % (lb, src))
+
+        normed = [(c, _norm_name(c)) for c in candidates]
+
+        win = tk.Toplevel(self)
+        win.title("频道别名（EPG 映射）")
+        win.configure(bg=COLORS["bg_panel"])
+        win.transient(self)
+        win.resizable(False, False)
+
+        ttk.Label(win, text="左侧选频道，右侧选对应的 EPG 频道名。"
+                            "★ 已手动映射   ✓ 自动匹配   ✗ 无 EPG；"
+                            "候选频道名后缀 _文件名 表示该 EPG 数据来自哪个 XML 源。",
+                  style="Dim.TLabel").grid(row=0, column=0, columnspan=2,
+                                           sticky="w", padx=10, pady=(10, 4))
+
+        lf = ttk.Frame(win, style="Panel.TFrame")
+        lf.grid(row=1, column=0, padx=(10, 6), pady=4)
+        sb = ttk.Scrollbar(lf, orient=tk.VERTICAL)
+        lb = tk.Listbox(lf, width=46, height=16, exportselection=False,
+                        activestyle="none", yscrollcommand=sb.set,
+                        bg=COLORS["bg_input"], fg=COLORS["fg_primary"],
+                        selectbackground=COLORS["select_bg"],
+                        selectforeground=COLORS["select_fg"],
+                        highlightthickness=0, bd=0, relief="flat")
+        sb.config(command=lb.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        rf = ttk.Frame(win, style="Panel.TFrame")
+        rf.grid(row=1, column=1, padx=(6, 10), pady=4, sticky="n")
+        ttk.Label(rf, text="EPG 频道名（共 %d 个）" % len(candidates),
+                  style="Dim.TLabel").pack(anchor="w")
+        ttk.Label(rf, text="筛选（输入关键字缩小下拉范围）",
+                  style="Dim.TLabel").pack(anchor="w", pady=(8, 0))
+        fvar = tk.StringVar()
+        ttk.Entry(rf, textvariable=fvar, width=36).pack(fill=tk.X, pady=(2, 6))
+        cvar = tk.StringVar()
+        cb = ttk.Combobox(rf, textvariable=cvar, values=candidates[:2000],
+                          state="readonly", width=34)
+        cb.pack(fill=tk.X)
+
+        def state_of(nm):
+            if alias.get(nm):
+                return "★"
+            return "✓" if _norm_name(nm) in names else "✗"
+
+        def row_text(nm):
+            t = "%s %s" % (state_of(nm), nm)
+            return t + "  →  " + alias[nm] if alias.get(nm) else t
+
+        def paint(i):
+            lb.itemconfig(i, fg=COLORS["epg_future"]
+                          if state_of(chans[i]) == "✗" else COLORS["fg_primary"])
+
+        for i, nm in enumerate(chans):
+            lb.insert(tk.END, row_text(nm))
+            paint(i)
+
+        def cur():
+            sel = lb.curselection()
+            return sel[0] if sel else None
+
+        def redraw(i):
+            lb.delete(i)
+            lb.insert(i, row_text(chans[i]))
+            paint(i)
+            lb.selection_set(i)
+            lb.see(i)
+
+        def on_select(_e=None):
+            i = cur()
+            if i is not None:
+                cvar.set(alias.get(chans[i], ""))
+
+        def on_pick(_e=None):
+            i = cur()
+            v = cvar.get()
+            if i is None or not v:
+                return
+            alias[chans[i]] = v
+            redraw(i)
+
+        def clear():
+            i = cur()
+            if i is None:
+                return
+            alias.pop(chans[i], None)
+            cvar.set("")
+            redraw(i)
+
+        def on_filter(*_):
+            k = _norm_name(fvar.get())
+            vals = [c for c, n in normed if k in n] if k else candidates
+            cb["values"] = vals[:2000]
+
+        def save():
+            if not save_epg_alias_file(alias):
+                messagebox.showerror("错误", "保存别名失败（无法写入 %s）"
+                                     % EPG_ALIAS_FILE, parent=win)
+                return
+            set_epg_alias(alias)
+            self._epg_color_set = None
+            self._epg_color_loading = False
+            self._start_epg_color_load()
+            self.refresh_slots()
+            win.destroy()
+
+        lb.bind("<<ListboxSelect>>", on_select)
+        cb.bind("<<ComboboxSelected>>", on_pick)
+        fvar.trace_add("write", on_filter)
+
+        bf = ttk.Frame(rf, style="Panel.TFrame")
+        bf.pack(pady=14)
+        ttk.Button(bf, text="清除映射", command=clear).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bf, text="保存", command=save).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bf, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=4)
+
+        win.grab_set()
+        center_window(win, self)
+
+    def open_epg_sources(self, parent=None):
+        win = tk.Toplevel(parent or self)
+        win.title("EPG 网络源管理")
+        win.configure(bg=COLORS["bg_panel"])
+        win.transient(parent or self)
+        win.resizable(False, False)
+
+        ttk.Label(win, text="每个地址对应一个 XMLTV 文件（.xml 或 .xml.gz，自动解压），"
+                            "保存在 src/epg/，重名自动改名。",
+                  style="Dim.TLabel").grid(row=0, column=0, columnspan=2,
+                                           sticky="w", padx=10, pady=(10, 4))
+        lf = ttk.Frame(win, style="Panel.TFrame")
+        lf.grid(row=1, column=0, columnspan=2, padx=10, pady=4)
+        sb = ttk.Scrollbar(lf, orient=tk.VERTICAL)
+        lb = tk.Listbox(lf, width=70, height=8, exportselection=False,
+                        selectmode=tk.EXTENDED, yscrollcommand=sb.set,
+                        bg=COLORS["bg_input"], fg=COLORS["fg_primary"],
+                        selectbackground=COLORS["select_bg"],
+                        selectforeground=COLORS["select_fg"],
+                        highlightthickness=0, bd=0, relief="flat")
+        sb.config(command=lb.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        for s in (self.cfg.get("epg_sources") or []):
+            lb.insert(tk.END, s)
+
+        var = tk.StringVar()
+        ent = ttk.Entry(win, textvariable=var, width=62)
+        ent.grid(row=2, column=0, padx=(10, 4), pady=6)
+
+        def add(_e=None):
+            s = var.get().strip().strip('"')
+            if not s:
+                return
+            if not (s.lower().startswith(("http://", "https://"))
+                    or os.path.isfile(s)):
+                messagebox.showerror("错误", "地址无效（需 http(s):// 或本地文件）",
+                                     parent=win)
+                return
+            if s not in lb.get(0, tk.END):
+                lb.insert(tk.END, s)
+            var.set("")
+
+        def delete():
+            for i in reversed(lb.curselection()):
+                lb.delete(i)
+
+        def browse():
+            p = filedialog.askopenfilename(
+                parent=win, filetypes=[("EPG 文件", "*.xml *.gz"), ("所有文件", "*.*")])
+            if p:
+                var.set(p)
+
+        def save(download):
+            st = self.epg_state
+            if st and not st["finished"]:
+                messagebox.showinfo("提示", "EPG 正在更新中，请稍后再修改。", parent=win)
+                return
+            try:
+                hrs = float(hrs_var.get())
+                if hrs <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("错误", "更新间隔必须是大于 0 的数字（小时）",
+                                     parent=win)
+                return
+            new = list(lb.get(0, tk.END))
+            changed = new != list(self.cfg.get("epg_sources") or [])
+            self.cfg["epg_sources"] = new
+            self.cfg["epg_auto_update"] = bool(auto_var.get())
+            self.cfg["epg_update_hours"] = hrs
+            if not save_epg_sources_file(new):
+                messagebox.showerror("错误", "无法写入 %s" % EPG_SOURCES_FILE,
+                                     parent=win)
+                return
+            self.save_config()
+            win.destroy()
+            if download or changed:
+                self.start_epg_update(silent=not download)
+
+        sch = ttk.Frame(win, style="Panel.TFrame")
+        sch.grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=(2, 0))
+        auto_var = tk.BooleanVar(value=bool(self.cfg.get("epg_auto_update", True)))
+        ttk.Checkbutton(sch, text="自动更新 EPG，间隔（小时）：",
+                        variable=auto_var).pack(side=tk.LEFT)
+        hrs_var = tk.StringVar(
+            value="%g" % float(self.cfg.get("epg_update_hours", 12) or 12))
+        ttk.Entry(sch, textvariable=hrs_var, width=6).pack(side=tk.LEFT, padx=4)
+        last = float(self.cfg.get("epg_last_update", 0) or 0)
+        ttk.Label(win, text="上次更新：" + (
+            datetime.fromtimestamp(last).strftime("%Y-%m-%d %H:%M") if last else "从未"),
+            style="Dim.TLabel").grid(row=4, column=0, columnspan=2,
+                                     sticky="w", padx=10)
+
+        ent.bind("<Return>", add)
+        ttk.Button(win, text="添加", command=add).grid(row=2, column=1, padx=(0, 10))
+        bf = ttk.Frame(win, style="Panel.TFrame")
+        bf.grid(row=5, column=0, columnspan=2, pady=10)
+        ttk.Button(bf, text="本地文件…", command=browse).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="删除选中", command=delete).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="保存", command=lambda: save(False)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="保存并下载", command=lambda: save(True)).pack(side=tk.LEFT, padx=6)
+        ttk.Button(bf, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=6)
+
+        win.grab_set()
+        center_window(win, parent or self)
 
     def open_epg_settings(self):
         win = tk.Toplevel(self)
@@ -4274,10 +5138,16 @@ class IPTVApp(tk.Tk):
                 vars_["epg_csv"].set(p)
         ttk.Button(win, text="浏览…", command=browse).grid(row=3, column=2, padx=(0, 10))
 
-        r = len(rows)
+        ttk.Button(win, text="设置 EPG 网络源（xml / gz）…",
+                   command=lambda: self.open_epg_sources(win)).grid(
+            row=len(rows), column=1, sticky="w", padx=10, pady=6)
+        r = len(rows) + 1
+
         ttk.Label(win, text="可用变量：{channelcode} 频道代码，{date} 按“日期格式”生成的日期。\n"
                             "最终地址 = 服务器地址 + 路径模板（路径模板可含 ?参数）。\n"
-                            "本地文件仍统一保存为 频道代码_YYYYMMDD.json。",
+                            "下载内容合并保存为 src/epg/iptv_epg.xml（不保留 JSON）；外部 XML/GZ 源自动解压后\n"
+                            "保存在同目录（重名自动改名）。频道冲突时以 iptv_epg.xml 为准。\n"
+                            "频道别名保存在 src/epg/alias.json。",
                   style="Dim.TLabel", justify=tk.LEFT).grid(
             row=r, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 2))
         pv = tk.StringVar()
@@ -4300,6 +5170,7 @@ class IPTVApp(tk.Tk):
         def collect():
             c = {k: v.get().strip() for k, v in vars_.items()}
             c["epg_csv"] = c["epg_csv"].strip('"')
+
             if not c["epg_host"].lower().startswith(("http://", "https://")):
                 raise ValueError("服务器地址必须以 http:// 或 https:// 开头")
             for var in ("{channelcode}", "{date}"):
@@ -4377,7 +5248,11 @@ class IPTVApp(tk.Tk):
                           "removed": 0, "error": None, "finished": False,
                           "cancel": False, "silent": silent,
                           "csv": epg_csv_path(self.cfg), "threads": threads,
-                          "timeout": timeout, "url_fn": _epg_url_fn(self.cfg)}
+                          "timeout": timeout, "url_fn": _epg_url_fn(self.cfg),
+                          "tz": int(self.cfg.get("tz_offset", 8)),
+                          "sources": list(self.cfg.get("epg_sources") or []),
+                          "src_ok": 0, "src_fail": 0,
+                          "built": False, "xml_count": 0}
         threading.Thread(target=epg_update_worker,
                          args=(self.epg_state, today, n, force),
                          daemon=True).start()
@@ -4395,11 +5270,29 @@ class IPTVApp(tk.Tk):
             self.after(500, self._poll_epg)
             return
 
-        changed = st["ok"] > 0 or st["removed"] > 0
+        changed = st["ok"] > 0 or st["removed"] > 0 or st["built"]
+        if not st["error"]:
+            try:
+                hrs = float(self.cfg.get("epg_update_hours", 12))
+            except Exception:
+                hrs = 12.0
+            if st["fail"] == 0 and st["src_fail"] == 0:
+                self.cfg["epg_last_update"] = time.time()
+            else:
+                self.cfg["epg_last_update"] = time.time() - max(0.0, hrs - 1.0) * 3600
+            self.save_config()
         if changed:
+            self._epg_color_set = None
+            self._epg_color_loading = False
+            self._start_epg_color_load()
             self._refresh_slots_keep_selection()
         summary = "EPG 更新完成：新增 %d，无数据 %d，失败 %d，清理过期 %d" % (
             st["ok"], st["nodata"], st["fail"], st["removed"])
+
+        if st["built"]:
+            summary += "；iptv_epg.xml 共 %d 个节目" % st["xml_count"]
+        if st["sources"]:
+            summary += "；外部源 成功 %d / 失败 %d" % (st["src_ok"], st["src_fail"])
 
         if st["silent"]:
             if not st["error"] and changed and not self.current_url and not self.recording:
@@ -4470,24 +5363,29 @@ class IPTVApp(tk.Tk):
             return
 
         slots, from_epg = self.build_day_slots(ch, day.date())
+        if self._slots_locked and not from_epg:
+            slots = []
         cur_idx = None
         for i, (label, s, e) in enumerate(slots):
             self.slot_list.insert(tk.END, "  " + label)
             self.slot_items.append((s, e))
             is_current = (s <= now < e)
-            if self._slots_locked:
-                self.slot_list.itemconfig(i, fg=COLORS["fg_dim"])
+            if is_current:
+                self.slot_list.itemconfig(i, fg=COLORS["live_green"])
             elif s >= now:
                 self.slot_list.itemconfig(i, fg=COLORS["epg_future"])
-            elif is_current:
-                self.slot_list.itemconfig(i, fg=COLORS["live_green"])
             if cur_idx is None and is_current:
                 cur_idx = i
 
-        if ch is None or self._slots_locked:
+        if ch is None:
             self.epg_var.set("")
+        elif self._slots_locked:
+            if from_epg:
+                self.epg_var.set("节目单：（%d 个节目）｜该频道不支持回看" % len(slots))
+            else:
+                self.epg_var.set("无 EPG 数据（可在 选项→频道别名 中映射）")
         elif from_epg:
-            self.epg_var.set("节目单：EPG（%d 个节目）" % len(slots))
+            self.epg_var.set("节目单：（%d 个节目）" % len(slots))
         else:
             self.epg_var.set("无 EPG 数据，按整点时段显示")
 
@@ -4502,8 +5400,8 @@ class IPTVApp(tk.Tk):
                 self.slot_list.configure(cursor="hand2")
             except Exception:
                 pass
-            if cur_idx is not None:
-                self.slot_list.see(cur_idx)
+        if cur_idx is not None:
+            self.slot_list.see(cur_idx)
 
     def selected_slot(self):
         if self._slots_locked or self._replay_allowed() is False:
@@ -4989,6 +5887,53 @@ class IPTVApp(tk.Tk):
         self._refresh_webdav_combo()
         self.status_var.set("已加载 %d 个频道：%s" % (len(self.channels), path))
 
+    def _channel_has_epg(self, ch):
+        if not ch or self._epg_color_set is None:
+            return False
+        nm = ch.get("name")
+        if not nm:
+            return False
+        return _norm_name(nm) in self._epg_color_set
+
+    def _start_epg_color_load(self):
+        if self._epg_color_set is not None or self._epg_color_loading:
+            return
+        self._epg_color_loading = True
+
+        def worker():
+            result = set()
+            try:
+                _, names = _get_epg_xml_index()
+                result = set(names.keys())
+                for k in EPG_ALIAS.keys():
+                    if k:
+                        result.add(_norm_name(k))
+            except Exception:
+                result = set()
+            try:
+                self.after(0, lambda r=result: self._on_epg_color_loaded(r))
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_epg_color_loaded(self, s):
+        self._epg_color_set = s
+        self._epg_color_loading = False
+        self._apply_epg_colors_to_list()
+
+    def _apply_epg_colors_to_list(self):
+        s = self._epg_color_set
+        if not s or self.webdav_mode:
+            return
+        for i, c in enumerate(self.filtered):
+            nm = c.get("name")
+            if nm and _norm_name(nm) in s:
+                try:
+                    self.ch_list.itemconfig(i, fg=COLORS["live_green"])
+                except Exception:
+                    pass
+
     def apply_filter(self):
         kw = self.search_var.get().strip().lower()
         source = self.webdav_items if self.webdav_mode else self.channels
@@ -5003,6 +5948,8 @@ class IPTVApp(tk.Tk):
                 self.ch_list.insert(tk.END, c["name"])
             else:
                 self.ch_list.insert(tk.END, "%d  %s" % (i + 1, c["name"]))
+                if self._channel_has_epg(c):
+                    self.ch_list.itemconfig(i, fg=COLORS["live_green"])
         if self.webdav_mode:
             self.count_var.set("%d / %d 项" % (len(self.filtered), len(source)))
         else:
@@ -5670,7 +6617,7 @@ class IPTVApp(tk.Tk):
         try:
             self.player.audio_set_mute(bool(self._muted))
             self.player.audio_set_volume(
-                max(0, min(125, int(self.vol_var.get()))))
+                max(0, min(150, int(self.vol_var.get()))))
         except Exception:
             pass
 
@@ -5683,7 +6630,7 @@ class IPTVApp(tk.Tk):
             v = int(self.vol_var.get())
         except Exception:
             v = 0
-        v = max(0, min(125, v))
+        v = max(0, min(150, v))
         if self._muted and v > 0:
             self._muted = False
             try:
@@ -5705,16 +6652,26 @@ class IPTVApp(tk.Tk):
     def _apply_left_visible(self):
         if self.left_visible:
             _raw_left = int(self.cfg.get("left_width", 200))
-            self.left_panel.configure(width=max(200, min(600, _raw_left)))
+            self.left_panel.configure(width=max(180, min(900, _raw_left)))
             self.left_panel.grid()
         else:
             self.left_panel.grid_remove()
+        if not self.fullscreen:
+            self.left_splitter.grid(row=0, column=1, sticky="ns")
+        else:
+            self.left_splitter.grid_remove()
 
     def _apply_right_visible(self):
         if self.right_visible:
+            _raw_right = int(self.cfg.get("right_width", 300))
+            self.right_panel.configure(width=max(180, min(900, _raw_right)))
             self.right_panel.grid()
         else:
             self.right_panel.grid_remove()
+        if not self.fullscreen:
+            self.right_splitter.grid(row=0, column=3, sticky="ns")
+        else:
+            self.right_splitter.grid_remove()
 
     def toggle_left(self):
         if self.fullscreen:
@@ -5775,7 +6732,9 @@ class IPTVApp(tk.Tk):
         self.fullscreen = True
 
         self.left_holder.grid_remove()
+        self.left_splitter.grid_remove()
         self.right_holder.grid_remove()
+        self.right_splitter.grid_remove()
         self.progress_frame.grid_remove()
         self.ctl_bar.grid_remove()
         self.status_bar.grid_remove()
@@ -5803,7 +6762,7 @@ class IPTVApp(tk.Tk):
 
         self.left_holder.grid(row=0, column=0, sticky="ns")
         self.left_holder.grid_rowconfigure(0, weight=1)
-        self.right_holder.grid(row=0, column=2, sticky="ns")
+        self.right_holder.grid(row=0, column=4, sticky="ns")
         self.right_holder.grid_rowconfigure(0, weight=1)
 
         self._apply_left_visible()
@@ -5858,6 +6817,7 @@ class IPTVApp(tk.Tk):
                 self.cfg["userid"] = vars_["userid"].get().strip()
                 self.cfg["authinfo"] = vars_["authinfo"].get().strip()
                 self.cfg["tz_offset"] = int(vars_["tz_offset"].get())
+                set_epg_tz(self.cfg["tz_offset"])
                 self.cfg["replay_days"] = max(1, int(vars_["replay_days"].get()))
             except ValueError:
                 messagebox.showerror("错误", "时区偏移与回看天数必须为整数", parent=win)
