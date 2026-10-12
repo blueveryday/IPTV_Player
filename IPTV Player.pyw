@@ -29,6 +29,7 @@ APP_TITLE = "IPTV Player"
 
 PY_BITS = struct.calcsize("P") * 8
 SEEK_GRANULARITY = 5
+MAX_VOLUME = 130
 
 MEDIA_EXTS = {
     ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".ts", ".m4v",
@@ -2655,7 +2656,7 @@ class IPTVApp(tk.Tk):
         except Exception:
             self.cfg["right_width"] = 300
         try:
-            self.cfg["volume"] = max(0, min(150, int(self.cfg.get("volume", 100))))
+            self.cfg["volume"] = max(0, min(MAX_VOLUME, int(self.cfg.get("volume", 100))))
         except Exception:
             self.cfg["volume"] = 100
         if not isinstance(self.cfg.get("webdav_sources"), list):
@@ -3019,7 +3020,7 @@ class IPTVApp(tk.Tk):
                                    command=self.toggle_mute)
         self.btn_mute.pack(side=tk.LEFT, padx=2)
         self.vol_var = tk.IntVar(value=int(self.cfg.get("volume", 100)))
-        ttk.Scale(ctl, from_=0, to=150, variable=self.vol_var, length=100,
+        ttk.Scale(ctl, from_=0, to=MAX_VOLUME, variable=self.vol_var, length=100,
                   command=self.on_volume).pack(side=tk.LEFT, padx=2)
         self.vol_pct_var = tk.StringVar(value="%d%%" % self.vol_var.get())
         self.vol_pct_label = ttk.Label(ctl, textvariable=self.vol_pct_var, width=5,
@@ -5873,7 +5874,7 @@ class IPTVApp(tk.Tk):
             "http-continuous": True,
             "hwdec": "auto" if self.cfg.get("hw_decode", True) else "no",
         }
-        vol = max(0, min(150, int(self.vol_var.get())))
+        vol = max(0, min(MAX_VOLUME, int(self.vol_var.get())))
         muted = bool(self._muted)
         self._submit_play(url, opts, vol, muted)
         self.status_var.set("正在播放：%s" % item["name"])
@@ -6146,7 +6147,7 @@ class IPTVApp(tk.Tk):
             messagebox.showwarning("文件不存在", path, parent=self)
             return
 
-        vol = max(0, min(150, int(self.vol_var.get())))
+        vol = max(0, min(MAX_VOLUME, int(self.vol_var.get())))
         muted = bool(self._muted)
         hw = bool(self.cfg.get("hw_decode", True))
         auto_sub = bool(self.cfg.get("sub_auto_load", True))
@@ -6252,7 +6253,7 @@ class IPTVApp(tk.Tk):
             if not low.startswith("rtsp://"):
                 opts["http-reconnect"] = True
             opts["hwdec"] = "auto" if self.cfg.get("hw_decode", True) else "no"
-            vol = max(0, min(150, int(self.vol_var.get())))
+            vol = max(0, min(MAX_VOLUME, int(self.vol_var.get())))
             muted = bool(self._muted)
             self._submit_play(url, opts, vol, muted)
         else:
@@ -6471,7 +6472,7 @@ class IPTVApp(tk.Tk):
                 self.btn_mute.configure(text="🔊", style="TButton")
         except Exception:
             pass
-        vol = max(0, min(150, int(self.vol_var.get())))
+        vol = max(0, min(MAX_VOLUME, int(self.vol_var.get())))
         self._mpv_call(self._mpv_set_volume, vol, bool(self._muted))
         self._flash_seek_status("已静音" if self._muted else "已取消静音")
 
@@ -6480,7 +6481,7 @@ class IPTVApp(tk.Tk):
             v = int(self.vol_var.get())
         except Exception:
             v = 0
-        v = max(0, min(150, v))
+        v = max(0, min(MAX_VOLUME, v))
         if self._muted and v > 0:
             self._muted = False
             try:
