@@ -26,7 +26,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install nuitka python-vlc ordered-set zstandard
+          pip install nuitka python-mpv ordered-set zstandard
 
       - name: Detect version from entry file
         id: version
@@ -50,46 +50,51 @@ jobs:
           echo "ENTRY_FILE=$($file.Name)" >> $env:GITHUB_ENV
           echo "SHORT_SHA=$shortSha" >> $env:GITHUB_ENV
 
+      - name: Download libmpv (GPL)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/mpv-player/mpv/releases/download/git-release/libmpv-v0.41.0-dev-g88eb9f2e7-38148483931-x86_64-w64-mingw32-gpl.zip"
+          $archive = Join-Path $env:RUNNER_TEMP "libmpv.zip"
+          $extractDir = Join-Path $env:RUNNER_TEMP "libmpv_extracted"
+
+          Write-Host "正在下载 libmpv (GPL) 从: $url"
+          Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+
+          Write-Host "正在解压..."
+          if (Test-Path $extractDir) { Remove-Item -Recurse -Force $extractDir }
+          New-Item -ItemType Directory -Path $extractDir | Out-Null
+          Expand-Archive -Path $archive -DestinationPath $extractDir -Force
+
+          $libmpvDll = Get-ChildItem -Path $extractDir -Recurse -Filter "libmpv-2.dll" | Select-Object -First 1
+          if (-not $libmpvDll) { throw "解压后未找到 libmpv-2.dll" }
+
+          Copy-Item $libmpvDll.FullName -Destination "libmpv-2.dll" -Force
+          $sizeMb = [math]::Round((Get-Item "libmpv-2.dll").Length / 1MB, 1)
+          Write-Host "已获取 libmpv-2.dll (GPL)，大小: $sizeMb MB"
+
       - name: Build EXE with Nuitka (MSVC)
         shell: pwsh
         run: |
-          python -m nuitka --standalone --windows-console-mode=disable --windows-icon-from-ico=src/asset/iptv.ico --enable-plugin=tk-inter --include-module=vlc --include-data-dir=src=src --nofollow-import-to=unittest --nofollow-import-to=test --nofollow-import-to=pydoc --nofollow-import-to=cgi --nofollow-import-to=cgitb --nofollow-import-to=chunk --nofollow-import-to=colorsys --nofollow-import-to=configparser --nofollow-import-to=crypt --nofollow-import-to=filecmp --nofollow-import-to=fileinput --nofollow-import-to=graphlib --nofollow-import-to=html.parser --nofollow-import-to=_markupbase --nofollow-import-to=imaplib --nofollow-import-to=imghdr --nofollow-import-to=mailcap --nofollow-import-to=modulefinder --nofollow-import-to=pickletools --nofollow-import-to=pipes --nofollow-import-to=poplib --nofollow-import-to=pstats --nofollow-import-to=pyclbr --nofollow-import-to=sched --nofollow-import-to=sndhdr --nofollow-import-to=sre_compile --nofollow-import-to=sre_constants --nofollow-import-to=sre_parse --nofollow-import-to=symtable --nofollow-import-to=timeit --nofollow-import-to=tomllib --nofollow-import-to=trace --nofollow-import-to=uu --nofollow-import-to=xdrlib --nofollow-import-to=_pyio --nofollow-import-to=importlib.simple --nofollow-import-to=importlib.resources.simple --noinclude-pytest-mode=nofollow --noinclude-setuptools-mode=nofollow --python-flag=no_docstrings --msvc=latest --lto=yes --assume-yes-for-downloads --remove-output --output-dir=dist --output-filename="IPTV Player.exe" "$env:ENTRY_FILE"
+          python -m nuitka --standalone --windows-console-mode=disable --windows-icon-from-ico=src/asset/iptv.ico --enable-plugin=tk-inter --include-module=mpv --include-data-dir=src=src --nofollow-import-to=unittest --nofollow-import-to=test --nofollow-import-to=pydoc --nofollow-import-to=cgi --nofollow-import-to=cgitb --nofollow-import-to=chunk --nofollow-import-to=colorsys --nofollow-import-to=configparser --nofollow-import-to=crypt --nofollow-import-to=filecmp --nofollow-import-to=fileinput --nofollow-import-to=graphlib --nofollow-import-to=html.parser --nofollow-import-to=_markupbase --nofollow-import-to=imaplib --nofollow-import-to=imghdr --nofollow-import-to=mailcap --nofollow-import-to=modulefinder --nofollow-import-to=pickletools --nofollow-import-to=pipes --nofollow-import-to=poplib --nofollow-import-to=pstats --nofollow-import-to=pyclbr --nofollow-import-to=sched --nofollow-import-to=sndhdr --nofollow-import-to=sre_compile --nofollow-import-to=sre_constants --nofollow-import-to=sre_parse --nofollow-import-to=symtable --nofollow-import-to=timeit --nofollow-import-to=tomllib --nofollow-import-to=trace --nofollow-import-to=uu --nofollow-import-to=xdrlib --nofollow-import-to=_pyio --nofollow-import-to=importlib.simple --nofollow-import-to=importlib.resources.simple --noinclude-pytest-mode=nofollow --noinclude-setuptools-mode=nofollow --python-flag=no_docstrings --msvc=latest --lto=yes --assume-yes-for-downloads --remove-output --output-dir=dist --output-filename="IPTV Player.exe" "$env:ENTRY_FILE"
 
-      - name: Bundle vlc_module
-        shell: pwsh
-        run: |
-          if (-not (Test-Path "vlc_module/libvlc.dll")) {
-            throw "未找到 vlc_module/libvlc.dll，请检查仓库中的 vlc_module 目录"
-          }
-          $dist = Get-ChildItem -Path dist -Directory -Filter "*.dist" | Select-Object -First 1
-          if (-not $dist) {
-            throw "未找到 Nuitka 生成的 .dist 目录"
-          }
-          $vlc = Join-Path $dist.FullName "vlc_module"
-          Copy-Item -Path "vlc_module" -Destination $vlc -Recurse -Force
-
-          $dropDirs = "gui","access_output","stream_out","mux","visualization","services_discovery","lua","meta_engine"
-          foreach ($d in $dropDirs) {
-            Remove-Item -Recurse -Force (Join-Path $vlc "plugins/$d") -ErrorAction SilentlyContinue
-          }
-          $dropFiles = "axvlc.dll","npvlc.dll","plugins/codec/libx264_plugin.dll","plugins/codec/libx26410b_plugin.dll","plugins/codec/libx265_plugin.dll"
-          foreach ($f in $dropFiles) {
-            Remove-Item -Force (Join-Path $vlc $f) -ErrorAction SilentlyContinue
-          }
-
-          $must = "libvlc.dll","libvlccore.dll","plugins/access/libhttp_plugin.dll","plugins/access/libhttps_plugin.dll","plugins/access/liblive555_plugin.dll","plugins/codec/libavcodec_plugin.dll","plugins/demux/libts_plugin.dll","plugins/video_output/libdirect3d11_plugin.dll","plugins/audio_output/libmmdevice_plugin.dll"
-          foreach ($f in $must) {
-            if (-not (Test-Path (Join-Path $vlc $f))) { throw "缺少必需的 VLC 组件: $f" }
-          }
-          $mb = [math]::Round((Get-ChildItem $vlc -Recurse -File | Measure-Object Length -Sum).Sum / 1MB, 1)
-          Write-Host "vlc_module 精简后大小: $mb MB"
-          echo "DIST_DIR=$($dist.FullName)" >> $env:GITHUB_ENV
-
-      - name: Bundle ffmpeg / ffprobe
+      - name: Bundle libmpv / ffmpeg / ffprobe
         shell: pwsh
         env:
           FFMPEG_VERSION: "8.1.2"
         run: |
+          # ---- 1. 找到 Nuitka 生成的 .dist 目录 ----
+          $dist = Get-ChildItem -Path dist -Directory -Filter "*.dist" | Select-Object -First 1
+          if (-not $dist) { throw "未找到 Nuitka 生成的 .dist 目录" }
+          Write-Host "目标目录: $($dist.FullName)"
+          echo "DIST_DIR=$($dist.FullName)" >> $env:GITHUB_ENV
+
+          if (-not (Test-Path "libmpv-2.dll")) {
+            throw "工作目录未找到 libmpv-2.dll，请检查下载步骤"
+          }
+          Copy-Item "libmpv-2.dll" -Destination $dist.FullName -Force
+          $sizeMb = [math]::Round((Get-Item (Join-Path $dist.FullName "libmpv-2.dll")).Length / 1MB, 1)
+          Write-Host "已放入 libmpv-2.dll，大小: $sizeMb MB"
+
           $url = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-$env:FFMPEG_VERSION-essentials_build.7z"
           $archive = Join-Path $env:RUNNER_TEMP "ffmpeg.7z"
           $extractDir = Join-Path $env:RUNNER_TEMP "ffmpeg_extracted"
@@ -111,17 +116,21 @@ jobs:
 
           $ffmpeg = Get-ChildItem -Path $extractDir -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
           $ffprobe = Get-ChildItem -Path $extractDir -Recurse -Filter "ffprobe.exe" | Select-Object -First 1
-
           if (-not $ffmpeg) { throw "压缩包中未找到 ffmpeg.exe" }
           if (-not $ffprobe) { throw "压缩包中未找到 ffprobe.exe" }
 
-          Copy-Item $ffmpeg.FullName -Destination $env:DIST_DIR -Force
-          Copy-Item $ffprobe.FullName -Destination $env:DIST_DIR -Force
+          Copy-Item $ffmpeg.FullName -Destination $dist.FullName -Force
+          Copy-Item $ffprobe.FullName -Destination $dist.FullName -Force
 
-          $sizeMb = [math]::Round(
-            ((Get-Item (Join-Path $env:DIST_DIR "ffmpeg.exe")).Length +
-             (Get-Item (Join-Path $env:DIST_DIR "ffprobe.exe")).Length) / 1MB, 1)
-          Write-Host "已放入 $env:DIST_DIR：ffmpeg.exe + ffprobe.exe，共 $sizeMb MB"
+          $ffSizeMb = [math]::Round(
+            ((Get-Item (Join-Path $dist.FullName "ffmpeg.exe")).Length +
+             (Get-Item (Join-Path $dist.FullName "ffprobe.exe")).Length) / 1MB, 1)
+          Write-Host "已放入 ffmpeg.exe + ffprobe.exe，共 $ffSizeMb MB"
+
+          Write-Host "`n=== dist 目录中的关键文件 ==="
+          Get-ChildItem $dist.FullName -File |
+            Where-Object { $_.Name -in @("IPTV Player.exe","libmpv-2.dll","ffmpeg.exe","ffprobe.exe") } |
+            Format-Table Name, @{Name="Size(MB)";Expression={[math]::Round($_.Length/1MB,1)}} -AutoSize
 
       - name: Smoke test (启动 15 秒，确认没有闪退)
         shell: pwsh
@@ -167,7 +176,7 @@ jobs:
             构建自提交: ${{ github.sha }}
 
             本发行版已内置：
-            - VLC 运行时组件（vlc_module/）
+            - libmpv 播放核心（libmpv-2.dll）
             - FFmpeg / FFprobe（LGPL/GPL，来自 https://www.gyan.dev/ffmpeg/builds/）
           files: IPTV*.7z
         env:

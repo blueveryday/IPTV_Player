@@ -24,7 +24,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime, timedelta, timezone
 
-CODE_VERSION = "IPTV Player v2026.10.11"
+CODE_VERSION = "IPTV Player v2026.10.12"
 APP_TITLE = "IPTV Player"
 
 PY_BITS = struct.calcsize("P") * 8
@@ -101,198 +101,10 @@ def center_window(win, parent=None):
     py = max(0, min(py, sh - h))
     win.geometry("+%d+%d" % (px, py))
 
-
-def _pe_bits(path):
-    try:
-        with open(path, "rb") as f:
-            f.seek(0x3C)
-            off = struct.unpack("<I", f.read(4))[0]
-            f.seek(off + 4)
-            machine = struct.unpack("<H", f.read(2))[0]
-        return {0x14C: 32, 0x8664: 64, 0xAA64: 64}.get(machine)
-    except Exception:
-        return None
-
-
 def _script_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
-
-
-def portable_vlc_dirs():
-    dirs = [os.path.join(_script_dir(), "vlc_module")]
-    la = os.environ.get("LOCALAPPDATA")
-    if la:
-        dirs.append(os.path.join(la, "IPTVPlayer", "vlc_module"))
-    return dirs
-
-
-def portable_vlc_target():
-    for d in portable_vlc_dirs():
-        try:
-            os.makedirs(d, exist_ok=True)
-            t = os.path.join(d, ".w")
-            open(t, "w").close()
-            os.remove(t)
-            return d
-        except OSError:
-            continue
-    return portable_vlc_dirs()[-1]
-
-
-def download_portable_vlc(dest_dir, progress, base=None):
-    import zipfile
-    arch = "win64" if PY_BITS == 64 else "win32"
-    base = base or "https://download.videolan.org/pub/videolan/vlc/last/%s/" % arch
-    hdr = {"User-Agent": "Mozilla/5.0 (IPTVPlayer)"}
-
-    def get(url):
-        return urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=30)
-
-    progress("正在查询 VLC 最新版本…")
-    name = None
-    try:
-        html = get(base).read().decode("utf-8", "replace")
-        names = set(re.findall(r"vlc-\d+(?:\.\d+)+-%s\.zip(?![\w.])" % arch, html))
-        if names:
-            name = max(names, key=lambda n: [int(x) for x in n.split("-")[1].split(".")])
-    except Exception:
-        pass
-    if not name:
-        name = "vlc-3.0.23-%s.zip" % arch
-
-    try:
-        m = re.search(r"\b[0-9a-fA-F]{64}\b", get(base + name + ".sha256").read().decode("utf-8", "replace"))
-        expected = m.group(0).lower()
-    except Exception as e:
-        raise RuntimeError("无法获取校验文件（%s.sha256），为安全起见已中止：%s" % (name, e))
-
-    os.makedirs(dest_dir, exist_ok=True)
-    tmp = os.path.join(dest_dir, "_vlc_download.zip")
-    h, done = hashlib.sha256(), 0
-    with get(base + name) as r, open(tmp, "wb") as f:
-        total = int(r.headers.get("Content-Length") or 0)
-        while True:
-            chunk = r.read(256 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
-            h.update(chunk)
-            done += len(chunk)
-            if total:
-                progress("正在下载 VLC 组件 %d%%（%.0f / %.0f MB）" % (
-                    done * 100 // total, done / 1048576.0, total / 1048576.0))
-            else:
-                progress("正在下载 VLC 组件 %.0f MB" % (done / 1048576.0))
-    if h.hexdigest().lower() != expected:
-        os.remove(tmp)
-        raise RuntimeError("下载文件的 SHA-256 校验失败，已丢弃，请重试")
-
-    progress("正在解压…")
-    root = os.path.abspath(dest_dir)
-    with zipfile.ZipFile(tmp) as z:
-        for info in z.infolist():
-            if info.is_dir():
-                continue
-            parts = info.filename.split("/")
-            if len(parts) < 2:
-                continue
-            rel = "/".join(parts[1:])
-            low = rel.lower()
-            keep = (len(parts) == 2 and low.endswith(".dll")) or \
-                   (low.startswith("plugins/") and not low.startswith("plugins/gui/"))
-            if not keep:
-                continue
-            out = os.path.abspath(os.path.join(root, *rel.split("/")))
-            if not out.startswith(root + os.sep):
-                continue
-            os.makedirs(os.path.dirname(out), exist_ok=True)
-            with z.open(info) as src, open(out, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-    os.remove(tmp)
-    if not os.path.isfile(os.path.join(root, "libvlc.dll")):
-        raise RuntimeError("解压完成但未找到 libvlc.dll")
-
-
-def find_vlc_installs():
-    cands = list(portable_vlc_dirs())
-    for env in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
-        base = os.environ.get(env)
-        if base:
-            cands.append(os.path.join(base, "VideoLAN", "VLC"))
-    try:
-        import winreg
-        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-            for key in (r"SOFTWARE\VideoLAN\VLC", r"SOFTWARE\WOW6432Node\VideoLAN\VLC"):
-                for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
-                    try:
-                        with winreg.OpenKey(root, key, 0, winreg.KEY_READ | view) as k:
-                            cands.append(winreg.QueryValueEx(k, "InstallDir")[0])
-                    except OSError:
-                        pass
-    except ImportError:
-        pass
-    found, seen = [], set()
-    for d in cands:
-        dll = os.path.join(d, "libvlc.dll")
-        key = os.path.normcase(os.path.abspath(d))
-        if key in seen or not os.path.isfile(dll):
-            continue
-        seen.add(key)
-        found.append((d, _pe_bits(dll)))
-    return found
-
-
-def prepare_vlc_path():
-    installs = find_vlc_installs()
-    match = [d for d, b in installs if b == PY_BITS]
-    if match:
-        d = match[0]
-        os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
-        try:
-            os.add_dll_directory(d)
-        except Exception:
-            pass
-    return (match[0] if match else None), installs
-
-
-VLC_MATCH_DIR, VLC_INSTALLS = None, []
-vlc = None
-VLC_IMPORT_ERROR = None
-_VLC_LOADED = False
-
-
-def load_vlc_module():
-    global vlc, VLC_IMPORT_ERROR, VLC_MATCH_DIR, VLC_INSTALLS, _VLC_LOADED
-    if _VLC_LOADED:
-        return
-    _VLC_LOADED = True
-    if sys.platform.startswith("win"):
-        VLC_MATCH_DIR, VLC_INSTALLS = prepare_vlc_path()
-    try:
-        import vlc as _v
-        vlc = _v
-    except ModuleNotFoundError:
-        vlc = None
-        VLC_IMPORT_ERROR = "missing"
-    except (Exception, SystemExit) as _e:
-        vlc = None
-        VLC_IMPORT_ERROR = "libvlc:%s: %s" % (type(_e).__name__, _e)
-
-
-def describe_vlc_problem(err):
-    detail = "\n\n技术详情：%s" % err
-    if not sys.platform.startswith("win"):
-        return "已安装 python-vlc，但找不到 libvlc。请先安装 VLC 播放器（Linux 用包管理器，macOS 安装 VLC.app）。" + detail
-    if not VLC_INSTALLS:
-        return ("已安装 python-vlc，但没有找到 VLC 的核心组件（libvlc.dll）。\n"
-                "python-vlc 只是调用接口，需要 %d 位的 VLC 组件（不必安装完整 VLC，免安装组件即可）。" % PY_BITS) + detail
-    if not VLC_MATCH_DIR:
-        bits = "、".join("%s 位" % b for _, b in VLC_INSTALLS)
-        return ("找到的 VLC 是 %s，但当前 Python 是 %d 位，位数不一致无法加载。\n"
-                "无需卸载：可以下载 %d 位的免安装组件放在程序目录里使用。" % (bits, PY_BITS, PY_BITS)) + detail
-    return "找到了 VLC（%s），但加载失败，请尝试重新安装 VLC。" % VLC_MATCH_DIR + detail
 
 
 def _long_path(path):
@@ -324,14 +136,6 @@ DEFAULT_M3U = os.path.join(APP_DIR, "iptv.m3u")
 CONFIG_FILE = os.path.join(APP_DIR, "iptv_config.json")
 RECORD_DIR = os.path.join(APP_DIR, "record")
 
-def resolve_m3u_path(cfg):
-    p = (cfg.get("m3u_file") or "").strip().strip('"')
-    if not p:
-        return DEFAULT_M3U
-    p = os.path.expanduser(p)
-    if not os.path.isabs(p):
-        p = os.path.join(APP_DIR, p)
-    return os.path.normpath(p)
 
 def find_ffmpeg():
     exe = "ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg"
@@ -532,17 +336,13 @@ def _ffprobe_run(cmd, timeout):
         return None
 
 
-def probe_audio_bitrate(ffprobe, url, use_tcp=True, timeout=10):
+def probe_audio_bitrate(ffprobe, url, timeout=10):
     if not ffprobe:
         return None
     cmd = [ffprobe, "-v", "quiet", "-print_format", "json",
            "-show_streams", "-select_streams", "a:0",
            "-analyzeduration", "3000000",
            "-probesize", "3000000"]
-    if use_tcp and str(url).lower().startswith("rtsp://"):
-        cmd += ["-rtsp_transport", "tcp",
-                "-rtsp_flags", "prefer_tcp",
-                "-rw_timeout", "10000000"]
     cmd += ["-i", url]
     stdout = _ffprobe_run(cmd, timeout)
     if not stdout:
@@ -561,17 +361,13 @@ def probe_audio_bitrate(ffprobe, url, use_tcp=True, timeout=10):
     return None
 
 
-def _probe_stream_codecs(ffprobe, url, use_tcp=True, timeout=10):
+def _probe_stream_codecs(ffprobe, url, timeout=10):
     if not ffprobe:
         return None, None
     cmd = [ffprobe, "-v", "quiet", "-print_format", "json",
            "-show_streams",
            "-analyzeduration", "3000000",
            "-probesize", "3000000"]
-    if use_tcp and str(url).lower().startswith("rtsp://"):
-        cmd += ["-rtsp_transport", "tcp",
-                "-rtsp_flags", "prefer_tcp",
-                "-rw_timeout", "10000000"]
     cmd += ["-i", url]
     stdout = _ffprobe_run(cmd, timeout)
     if not stdout:
@@ -592,17 +388,13 @@ def _probe_stream_codecs(ffprobe, url, use_tcp=True, timeout=10):
     return v_codec, a_codec
 
 
-def _ffprobe_full_info(ffprobe, url, use_tcp=True, timeout=15):
+def _ffprobe_full_info(ffprobe, url, timeout=15):
     if not ffprobe:
         return None
     cmd = [ffprobe, "-v", "quiet", "-print_format", "json",
            "-show_streams", "-show_format",
            "-analyzeduration", "3000000",
            "-probesize", "3000000"]
-    if use_tcp and str(url).lower().startswith("rtsp://"):
-        cmd += ["-rtsp_transport", "tcp",
-                "-rtsp_flags", "prefer_tcp",
-                "-rw_timeout", "10000000"]
     cmd += ["-i", url]
     stdout = _ffprobe_run(cmd, timeout)
     if not stdout:
@@ -947,15 +739,13 @@ class HLSRewriteProxy(object):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
 
-
 DEFAULT_CONFIG = {
     "userid": "gf001",
     "authinfo": "xxx",
     "replay_player": "",
     "cfg_ver": 2,
     "auto_install_vlc": False,
-    "hw_decode": False,
-    "rtsp_tcp": False,
+    "hw_decode": True,
     "http_replay_keys": ["/rtsp/"],
     "template": "{base}?AuthInfo={authinfo}&userid={userid}&playseek={seek}",
     "tz_offset": 8,
@@ -979,7 +769,6 @@ DEFAULT_CONFIG = {
     "sub_auto_load": True,
     "m3u_file": "",
 }
-
 
 class SeekBar(tk.Canvas):
     def __init__(self, master, on_seek=None, height=18, **kw):
@@ -1079,7 +868,7 @@ class PanelToggle(tk.Canvas):
 
     def __init__(self, master, command=None, width=14, height=46, **kw):
         super().__init__(master, width=width, height=height,
-                         bg=COLORS["bg_panel"], highlightthickness=0, bd=0,
+                         bg=COLORS["bg_video"], highlightthickness=0, bd=0,
                          cursor="hand2", takefocus=0, **kw)
         self._command = command
         self._hover = False
@@ -1103,17 +892,18 @@ class PanelToggle(tk.Canvas):
             return
         cx, cy = w // 2, h // 2
         color = COLORS["accent"] if self._hover else COLORS["fg_secondary"]
-        half = 7
+        half = 9
         gap = 2
         self.create_line(cx - gap, cy - half, cx - gap, cy + half,
                          fill=color, width=2)
         self.create_line(cx + gap, cy - half, cx + gap, cy + half,
                          fill=color, width=2)
 
+
 class VSplitter(tk.Frame):
     def __init__(self, master, on_drag=None, on_release=None, on_press=None,
                  width=6, **kw):
-        super().__init__(master, width=width, bg=COLORS["border"],
+        super().__init__(master, width=width, bg=COLORS["bg_video"],
                          cursor="sb_h_double_arrow", **kw)
         self._on_drag = on_drag
         self._on_release = on_release
@@ -1143,6 +933,7 @@ class VSplitter(tk.Frame):
             self._on_release()
         self._active = False
 
+
 class StatusVar(tk.StringVar):
     def __init__(self, app, **kw):
         super().__init__(app, **kw)
@@ -1157,7 +948,6 @@ class StatusVar(tk.StringVar):
             self._app._on_status_set()
         except Exception:
             pass
-
 
 def read_text_auto(path):
     raw = open(path, "rb").read()
@@ -1561,6 +1351,7 @@ def save_epg_alias_file(d):
     except Exception:
         return False
 
+
 def load_epg_sources_file():
     try:
         with open(EPG_SOURCES_FILE, "r", encoding="utf-8") as f:
@@ -1579,6 +1370,7 @@ def save_epg_sources_file(lst):
     except Exception:
         return False
 
+
 def set_epg_tz(h, days=None):
     global EPG_TZ_HOURS, EPG_KEEP_DAYS
     try:
@@ -1591,6 +1383,7 @@ def set_epg_tz(h, days=None):
         except Exception:
             EPG_KEEP_DAYS = 7
     _epg_xml_cache["sig"] = None
+
 
 def _norm_name(s):
     return re.sub(r'[\\/:*?"<>|_\s\-]+', "", s or "").lower()
@@ -1856,6 +1649,7 @@ def epg_clear_all():
     if keep:
         save_epg_sources_file(keep)
     _epg_xml_cache["sig"] = None
+
 
 def load_epg_channels(csv_path):
     items, seen = [], set()
@@ -2296,6 +2090,75 @@ def apply_app_icon(win):
     except Exception:
         pass
 
+mpv = None
+MPV_IMPORT_ERROR = None
+_MPV_LOADED = False
+
+
+def _find_mpv_dll():
+    names = ["mpv-2.dll", "libmpv-2.dll"]
+    dirs = [
+        APP_DIR,
+        os.path.join(APP_DIR, "mpv"),
+        os.path.join(APP_DIR, "mpv", "bin"),
+        os.path.join(APP_DIR, "bin"),
+        _script_dir(),
+    ]
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if d:
+            dirs.append(d)
+    for d in dirs:
+        for n in names:
+            p = os.path.join(d, n)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def load_mpv_module():
+    global mpv, MPV_IMPORT_ERROR, _MPV_LOADED
+    if _MPV_LOADED:
+        return
+    _MPV_LOADED = True
+
+    dll_path = _find_mpv_dll()
+    if dll_path:
+        dll_dir = os.path.dirname(dll_path)
+        if sys.platform.startswith("win"):
+            os.environ["PATH"] = dll_dir + os.pathsep + os.environ.get("PATH", "")
+            try:
+                os.add_dll_directory(dll_dir)
+            except Exception:
+                pass
+
+    try:
+        import mpv as _m
+        mpv = _m
+        _test = _m.MPV()
+        _test.terminate()
+        _test = None
+    except ModuleNotFoundError:
+        mpv = None
+        MPV_IMPORT_ERROR = "missing"
+    except Exception as e:
+        mpv = None
+        MPV_IMPORT_ERROR = "libmpv:%s: %s" % (type(e).__name__, e)
+
+
+def describe_mpv_problem(err):
+    detail = "\n\n技术详情：%s" % err
+    if err == "missing":
+        return ("未安装 python-mpv 模块。\n"
+                "请执行：pip install python-mpv\n"
+                "并确保 mpv-2.dll（或 libmpv-2.dll）位于程序目录或系统 PATH 中。") + detail
+    if not _find_mpv_dll():
+        return ("已安装 python-mpv，但未找到 libmpv 核心组件（mpv-2.dll 或 libmpv-2.dll）。\n\n"
+                "解决方式：\n"
+                "1. 下载 libmpv 的 Windows 构建包\n"
+                "2. 解压得到 libmpv-2.dll（无需重命名，python-mpv 会自动识别）\n"
+                "3. 放在程序目录（与 exe 同目录）或系统 PATH 中\n\n"
+                "下载地址：https://github.com/mpv-player/mpv/releases/tag/git-release") + detail
+    return "找到了 mpv 组件但加载失败，请检查位数是否与 Python 匹配（当前 %d 位）。" % PY_BITS + detail
 
 class IPTVApp(tk.Tk):
     def __init__(self):
@@ -2319,11 +2182,11 @@ class IPTVApp(tk.Tk):
         self.ext_proc = None
 
         self.player = None
-        self.vlc_instance = None
+        self._mpv_lock = threading.Lock()
+
         self.fullscreen = False
 
         self._closing = False
-        self._player_error_cb = None
         self._closing_after_id = None
         self._seek_status_after_id = None
         self._video_click_after_id = None
@@ -2374,19 +2237,16 @@ class IPTVApp(tk.Tk):
 
         self._snapshot_pending = []
 
-        self._vlc_q = queue.Queue()
-        self._vlc_thread = None
-        self._play_token = 0
-
         self._cache = {
-            "time": 0,
-            "length": 0,
-            "seekable": False,
-            "state": None,
+            "time": 0.0,
+            "length": 0.0,
+            "pause": True,
+            "core_idle": True,
             "video_track_count": -1,
-            "spu_tracks": [],
-            "spu_current": -1,
+            "sub_tracks": [],
+            "sub_current": -1,
         }
+        self._play_token = 0
 
         self._left_drag_w = 0
         self._right_drag_w = 0
@@ -2406,92 +2266,60 @@ class IPTVApp(tk.Tk):
                    self.auto_epg_update)
         self.after(400, self._start_epg_color_load)
 
-    def _vlc_call(self, fn, *args, done=None):
-        if done is None:
-            self._vlc_q.put((fn, args, None))
-        else:
-            def wrapped(r, e):
-                if getattr(self, "_closing", False):
-                    return
-                try:
-                    self.after(0, lambda: done(r, e))
-                except Exception:
-                    pass
-            self._vlc_q.put((fn, args, wrapped))
-
-    def _vlc_worker_loop(self):
-        while True:
-            try:
-                item = self._vlc_q.get(timeout=0.25)
-            except queue.Empty:
-                try:
-                    self._refresh_cache()
-                except Exception:
-                    pass
-                continue
-            except Exception:
+    def _mpv_call(self, fn, *args, done=None):
+        with self._mpv_lock:
+            if self.player is None:
                 return
-
-            if item is None:
-                try:
-                    while True:
-                        self._vlc_q.get_nowait()
-                except queue.Empty:
-                    pass
-                return
-
-            try:
-                fn, args, done = item
-            except Exception:
-                continue
             try:
                 r = fn(*args)
                 err = None
             except Exception as e:
                 r = None
                 err = e
-            if done is not None:
-                try:
-                    done(r, err)
-                except Exception:
-                    pass
+        if done is not None:
+            if getattr(self, "_closing", False):
+                return
+            try:
+                self.after(0, lambda: done(r, err))
+            except Exception:
+                pass
 
-    def _refresh_cache(self):
+    def _mpv_refresh_cache(self):
         p = self.player
         if p is None:
             return
         c = self._cache
         try:
-            c["time"] = p.get_time()
+            c["time"] = float(p.time_pos or 0)
         except Exception:
             pass
         try:
-            c["length"] = p.get_length()
+            c["length"] = float(p.duration or 0)
         except Exception:
             pass
         try:
-            c["seekable"] = bool(p.is_seekable())
+            c["pause"] = bool(p.pause)
         except Exception:
             pass
         try:
-            c["state"] = p.get_state()
+            c["core_idle"] = bool(p.core_idle)
         except Exception:
             pass
         try:
-            c["video_track_count"] = p.video_get_track_count()
+            tracks = p.video_track_list or []
+            c["video_track_count"] = len(tracks)
         except Exception:
             pass
         try:
-            c["spu_tracks"] = list(p.video_get_spu_description() or [])
+            c["sub_tracks"] = list(p.sub_track_list or [])
         except Exception:
             pass
         try:
-            c["spu_current"] = p.video_get_spu()
+            c["sub_current"] = p.sid
         except Exception:
             pass
 
-
-    def _vlc_stop(self):
+    def _mpv_stop(self):
         p = self.player
         if p is None:
             return
@@ -2500,54 +2328,104 @@ class IPTVApp(tk.Tk):
         except Exception:
             pass
 
-    def _vlc_pause(self):
+    def _mpv_pause(self):
         p = self.player
         if p is None:
             return
         try:
-            p.pause()
+            p.pause = not p.pause
         except Exception:
             pass
 
-    def _vlc_set_time(self, ms):
+    def _mpv_set_pause(self, val):
         p = self.player
         if p is None:
             return
         try:
-            p.set_time(int(ms))
+            p.pause = bool(val)
         except Exception:
             pass
 
-    def _vlc_set_volume(self, vol, muted):
+    def _mpv_seek(self, ms):
         p = self.player
         if p is None:
             return
         try:
-            p.audio_set_mute(bool(muted))
-            p.audio_set_volume(int(vol))
+            p.command("seek", ms / 1000.0, "absolute+exact")
         except Exception:
             pass
 
-    def _vlc_play_media(self, url, opts, vol, muted):
+    def _mpv_set_volume(self, vol, muted):
         p = self.player
-        inst = self.vlc_instance
-        if p is None or inst is None:
+        if p is None:
+            return
+        try:
+            p.volume = int(vol)
+            p.mute = bool(muted)
+        except Exception:
+            pass
+
+    def _mpv_play_media(self, url, opts, vol, muted):
+        p = self.player
+        if p is None:
+            return
+        try:
+            p.stop()
+        except Exception:
+            pass
+        if opts:
+            try:
+                for k, v in opts.items():
+                    try:
+                        p[k] = v
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        try:
+            p.play(url)
+            p.volume = int(vol)
+            p.mute = bool(muted)
+        except Exception:
+            pass
+
+    def _mpv_play_local(self, path, vol, muted, hw, auto_sub):
+        p = self.player
+        if p is None:
             return
         try:
             p.stop()
         except Exception:
             pass
         try:
-            media = inst.media_new(url)
-            for o in opts:
-                media.add_option(o)
-            p.set_media(media)
-            media.release()
-            p.play()
-            p.audio_set_volume(int(vol))
-            p.audio_set_mute(bool(muted))
+            p["hwdec"] = "auto" if hw else "no"
         except Exception:
             pass
+
+        sub_paths = []
+        if auto_sub:
+            try:
+                subs = find_sibling_subs(path)
+            except Exception:
+                subs = []
+            for s in subs:
+                try:
+                    sub_paths.append(prepare_sub_file(s))
+                except Exception:
+                    pass
+
+        try:
+            p.play(path)
+            p.volume = int(vol)
+            p.mute = bool(muted)
+        except Exception:
+            pass
+
+        for sp in sub_paths:
+            try:
+                p.command("sub-add", sp)
+            except Exception:
+                pass
 
     def _submit_play(self, url, opts, vol, muted):
         self._play_token += 1
@@ -2556,8 +2434,8 @@ class IPTVApp(tk.Tk):
         def _do():
             if token != self._play_token:
                 return
-            self._vlc_play_media(url, opts, vol, muted)
-        self._vlc_call(_do)
+            self._mpv_play_media(url, opts, vol, muted)
+        self._mpv_call(_do)
 
     def _submit_play_local(self, path, vol, muted, hw, auto_sub):
         self._play_token += 1
@@ -2566,134 +2444,51 @@ class IPTVApp(tk.Tk):
         def _do():
             if token != self._play_token:
                 return
-            p = self.player
-            inst = self.vlc_instance
-            if p is None or inst is None:
-                return
-            try:
-                p.stop()
-            except Exception:
-                pass
-            media = None
-            try:
-                media = inst.media_new(self._path_to_mrl(path))
-            except Exception:
-                pass
-            if media is None or not media.get_mrl():
-                if media is not None:
-                    try:
-                        media.release()
-                    except Exception:
-                        pass
-                try:
-                    media = inst.media_new_path(path)
-                except Exception:
-                    media = None
-            if media is None:
-                return
-            try:
-                media.add_option(":avcodec-hw=%s"
-                                 % ("any" if hw else "none"))
-            except Exception:
-                pass
-            if auto_sub:
-                try:
-                    subs = find_sibling_subs(path)
-                except Exception:
-                    subs = []
-                for i, s in enumerate(subs):
-                    try:
-                        media.slaves_add(vlc.MediaSlaveType.subtitle,
-                                         4 if i == 0 else 3,
-                                         self._path_to_mrl(prepare_sub_file(s)))
-                    except Exception:
-                        pass
-            try:
-                p.set_media(media)
-                p.play()
-                p.audio_set_volume(int(vol))
-                p.audio_set_mute(bool(muted))
-            except Exception:
-                pass
-        self._vlc_call(_do)
+            self._mpv_play_local(path, vol, muted, hw, auto_sub)
+        self._mpv_call(_do)
 
-    def _vlc_add_subtitle(self, mrl, real_path):
-        p = self.player
-        if p is None:
-            return
-        ok = False
-        try:
-            if hasattr(p, "add_slave"):
-                ok = (p.add_slave(vlc.MediaSlaveType.subtitle, mrl, True) == 0)
-        except Exception:
-            ok = False
-        if not ok:
-            try:
-                p.video_set_subtitle_file(real_path)
-            except Exception:
-                pass
-
-    def _vlc_ensure_sub(self):
+    def _mpv_add_subtitle(self, sub_path):
         p = self.player
         if p is None:
             return
         try:
-            if p.video_get_spu() == -1:
-                tracks = p.video_get_spu_description() or []
-                real = [t for t in tracks if t[0] != -1]
-                if real:
-                    p.video_set_spu(real[-1][0])
+            p.command("sub-add", sub_path)
         except Exception:
             pass
 
-    def _vlc_set_spu(self, tid):
+    def _mpv_set_sub_track(self, sid):
         p = self.player
         if p is None:
             return
         try:
-            p.video_set_spu(int(tid))
+            p.sid = int(sid)
         except Exception:
             pass
 
-    def _vlc_adjust_spu_delay(self, delta_ms, reset):
+    def _mpv_adjust_sub_delay(self, delta_ms, reset):
         p = self.player
         if p is None:
             return None
         try:
-            cur = p.video_get_spu_delay()
-            new = 0 if reset else cur + int(delta_ms) * 1000
-            p.video_set_spu_delay(new)
+            cur = p.sub_delay or 0.0
+            new = 0.0 if reset else cur + int(delta_ms) / 1000.0
+            p.sub_delay = new
             return new
         except Exception:
             return None
 
-    def _vlc_take_snapshot(self, path):
+    def _mpv_take_snapshot(self, path):
         p = self.player
         if p is None:
             return None
         try:
-            return p.video_take_snapshot(0, path, 0, 0)
+            p.command("screenshot-to-file", path)
+            return 0
         except Exception:
             return None
-
-    def _vlc_cleanup(self):
-        p = self.player
-        if p is None:
-            return
-        try:
-            em = p.event_manager()
-            if self._player_error_cb is not None:
-                em.event_detach(vlc.EventType.MediaPlayerEncounteredError)
-        except Exception:
-            pass
-        try:
-            p.stop()
-        except Exception:
-            pass
 
     def _cancel_play_req(self):
         self._play_token += 1
-
 
     def _setup_ttk_style(self):
         style = ttk.Style(self)
@@ -2711,6 +2506,10 @@ class IPTVApp(tk.Tk):
 
         style.configure("TFrame", background=COLORS["bg_root"])
         style.configure("Panel.TFrame", background=COLORS["bg_panel"])
+        style.configure("Sidebar.TFrame", background=COLORS["bg_video"])
+        style.configure("Collapse.TFrame", background=COLORS["bg_video"])
+        style.configure("SidebarDim.TLabel", background=COLORS["bg_video"],
+                        foreground=COLORS["fg_secondary"])
         style.configure("Toolbar.TFrame", background=COLORS["bg_panel"])
         style.configure("Status.TFrame", background=COLORS["status_bg"])
 
@@ -2863,6 +2662,9 @@ class IPTVApp(tk.Tk):
             self.cfg["webdav_sources"] = []
         if "record_stop_on_switch" not in self.cfg:
             self.cfg["record_stop_on_switch"] = True
+        if "hw_decode" not in self.cfg:
+            self.cfg["hw_decode"] = True
+        self.cfg.pop("rtsp_tcp", None)
         sources = load_epg_sources_file()
         old_sources = self.cfg.get("epg_sources")
         if not sources and isinstance(old_sources, list) and old_sources:
@@ -2886,6 +2688,7 @@ class IPTVApp(tk.Tk):
         try:
             cfg_copy = dict(self.cfg)
             cfg_copy.pop("epg_sources", None)
+            cfg_copy.pop("rtsp_tcp", None)
             with open(CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(cfg_copy, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -2941,31 +2744,6 @@ class IPTVApp(tk.Tk):
         rm.add_command(label="打开录制目录", command=self.open_record_dir)
         menubar.add_cascade(label="录制", menu=rm)
 
-        em = tk.Menu(
-            menubar, tearoff=0,
-            bg=COLORS["bg_panel"],
-            fg=COLORS["fg_primary"],
-            disabledforeground=COLORS["disabled_fg"],
-            activebackground=COLORS["accent_dim"],
-            activeforeground=MENU_CHECK_ACTIVE_FG,
-            selectcolor=MENU_CHECK_FG)
-        self.hw_var = tk.BooleanVar(value=bool(self.cfg.get("hw_decode", True)))
-        self.tcp_var = tk.BooleanVar(value=bool(self.cfg.get("rtsp_tcp", True)))
-        em.add_checkbutton(label="硬件解码", variable=self.hw_var,
-                           command=self.on_decode_option_changed)
-        em.add_checkbutton(label="RTSP 使用 TCP（仅对 rtsp:// 生效）",
-                           variable=self.tcp_var,
-                           command=self.on_decode_option_changed)
-        em.add_separator()
-        em.add_command(label="下载 EPG", command=self.manual_epg_update)
-        em.add_command(label="自定义 EPG 下载参数...", command=self.open_epg_settings)
-        em.add_command(label="设置 EPG 网络源...", command=self.open_epg_sources)
-        em.add_separator()
-        em.add_command(label="频道别名...", command=self.open_epg_alias)
-        em.add_separator()
-        em.add_command(label="打开截图目录", command=self.open_screenshot_dir)
-        menubar.add_cascade(label="选项", menu=em)
-
         sm = tk.Menu(
             menubar, tearoff=0,
             bg=COLORS["bg_panel"], fg=COLORS["fg_primary"],
@@ -2999,6 +2777,31 @@ class IPTVApp(tk.Tk):
             postcommand=self._rebuild_sub_track_menu)
         sm.add_cascade(label="字幕轨道", menu=self.sub_track_menu)
         menubar.add_cascade(label="字幕", menu=sm)
+
+        em = tk.Menu(
+            menubar, tearoff=0,
+            bg=COLORS["bg_panel"],
+            fg=COLORS["fg_primary"],
+            disabledforeground=COLORS["disabled_fg"],
+            activebackground=COLORS["accent_dim"],
+            activeforeground=MENU_CHECK_ACTIVE_FG,
+            selectcolor=MENU_CHECK_FG)
+        self.hw_var = tk.BooleanVar(value=bool(self.cfg.get("hw_decode", True)))
+        em.add_checkbutton(label="硬件解码", variable=self.hw_var,
+                           command=self.on_decode_option_changed)
+        em.add_separator()
+        em.add_command(label="切换频道栏 (F2)", command=self.toggle_left)
+        em.add_command(label="切换EPG栏 (F3)", command=self.toggle_right)
+        em.add_command(label="截图 (F4)", command=self.take_snapshot)
+        em.add_separator()
+        em.add_command(label="下载 EPG", command=self.manual_epg_update)
+        em.add_command(label="自定义 EPG 下载参数...", command=self.open_epg_settings)
+        em.add_command(label="设置 EPG 网络源...", command=self.open_epg_sources)
+        em.add_separator()
+        em.add_command(label="频道别名...", command=self.open_epg_alias)
+        em.add_separator()
+        em.add_command(label="打开截图目录", command=self.open_screenshot_dir)
+        menubar.add_cascade(label="选项", menu=em)
 
         menubar.add_command(label="关于", command=self.show_about)
 
@@ -3086,21 +2889,21 @@ class IPTVApp(tk.Tk):
         _raw_right = int(self.cfg.get("right_width", 300))
         right_w = max(180, min(900, _raw_right))
 
-        left_holder = ttk.Frame(self, style="Panel.TFrame")
+        left_holder = ttk.Frame(self, style="Sidebar.TFrame")
         left_holder.grid(row=0, column=0, sticky="ns")
         left_holder.grid_rowconfigure(0, weight=1)
         self.left_holder = left_holder
 
-        left_btn_col = ttk.Frame(left_holder, style="Panel.TFrame")
+        left_btn_col = ttk.Frame(left_holder, style="Collapse.TFrame")
         left_btn_col.grid(row=0, column=0, sticky="ns")
         left_btn_col.grid_rowconfigure(0, weight=1)
         left_btn_col.grid_rowconfigure(2, weight=1)
         self.left_btn_col = left_btn_col
         self.left_btn = PanelToggle(left_btn_col, command=self.toggle_left,
-                                    width=14, height=46)
+                                    width=7, height=46)
         self.left_btn.grid(row=1, column=0)
 
-        left = ttk.Frame(left_holder, width=left_w, style="Panel.TFrame")
+        left = ttk.Frame(left_holder, width=left_w, style="Sidebar.TFrame")
         left.grid(row=0, column=1, sticky="ns")
         left.grid_propagate(False)
         left.pack_propagate(False)
@@ -3108,12 +2911,12 @@ class IPTVApp(tk.Tk):
         left.grid_rowconfigure(0, weight=1)
         left.grid_columnconfigure(0, weight=1)
 
-        self.left_body = ttk.Frame(left, style="Panel.TFrame")
+        self.left_body = ttk.Frame(left, style="Sidebar.TFrame")
         self.left_body.grid(row=0, column=0, sticky="nsew")
 
-        wf = ttk.Frame(self.left_body, style="Panel.TFrame")
+        wf = ttk.Frame(self.left_body, style="Sidebar.TFrame")
         wf.pack(fill=tk.X, padx=8, pady=(8, 2))
-        ttk.Label(wf, text="快捷菜单", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(wf, text="快捷菜单", style="SidebarDim.TLabel").pack(side=tk.LEFT, padx=(0, 6))
         self.webdav_var = tk.StringVar()
         self.webdav_cb = ttk.Combobox(wf, textvariable=self.webdav_var,
                                       state="readonly", width=1)
@@ -3121,23 +2924,24 @@ class IPTVApp(tk.Tk):
         self.webdav_cb.bind("<<ComboboxSelected>>", self._on_webdav_combo)
         self.webdav_cb.bind("<Button-1>", self._on_webdav_combo_prepare, add="+")
         self._webdav_combo_sources = []
+        self.current_m3u_path = self._resolve_default_m3u()
         self._refresh_webdav_combo()
 
-        sf = ttk.Frame(self.left_body, style="Panel.TFrame")
+        sf = ttk.Frame(self.left_body, style="Sidebar.TFrame")
         sf.pack(fill=tk.X, padx=8, pady=(4, 4))
-        ttk.Label(sf, text="搜索", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(sf, text="搜索", style="SidebarDim.TLabel").pack(side=tk.LEFT, padx=(0, 6))
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *a: self.apply_filter())
         search_entry = ttk.Entry(sf, textvariable=self.search_var, style="TEntry")
         search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        lf = ttk.Frame(self.left_body, style="Panel.TFrame")
+        lf = ttk.Frame(self.left_body, style="Sidebar.TFrame")
         lf.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
         sb = ttk.Scrollbar(lf, orient=tk.VERTICAL)
         self.ch_list = tk.Listbox(lf, activestyle="none", exportselection=False,
                                   yscrollcommand=sb.set,
                                   font=("Microsoft YaHei UI", 10),
-                                  bg=COLORS["bg_input"], fg=COLORS["fg_primary"],
+                                  bg=COLORS["bg_video"], fg=COLORS["fg_primary"],
                                   selectbackground=COLORS["select_bg"],
                                   selectforeground=COLORS["select_fg"],
                                   highlightthickness=0, bd=0,
@@ -3153,7 +2957,7 @@ class IPTVApp(tk.Tk):
 
         self.count_var = tk.StringVar(value="0 个频道")
         ttk.Label(self.left_body, textvariable=self.count_var,
-                  style="Dim.TLabel").pack(anchor="w", padx=10, pady=(2, 8))
+                  style="SidebarDim.TLabel").pack(anchor="w", padx=10, pady=(2, 8))
 
         self.left_splitter = VSplitter(self,
                                        on_drag=self._on_left_split_drag,
@@ -3161,7 +2965,7 @@ class IPTVApp(tk.Tk):
                                        on_press=self._on_left_split_press,
                                        width=6)
 
-        mid = ttk.Frame(self)
+        mid = ttk.Frame(self, style="Sidebar.TFrame")
         mid.grid(row=0, column=2, sticky="nsew")
         self.mid_panel = mid
         mid.grid_rowconfigure(0, weight=1)
@@ -3241,12 +3045,12 @@ class IPTVApp(tk.Tk):
                                         on_press=self._on_right_split_press,
                                         width=6)
 
-        right_holder = ttk.Frame(self, style="Panel.TFrame")
+        right_holder = ttk.Frame(self, style="Sidebar.TFrame")
         right_holder.grid(row=0, column=4, sticky="ns")
         right_holder.grid_rowconfigure(0, weight=1)
         self.right_holder = right_holder
 
-        right = ttk.Frame(right_holder, width=right_w, style="Panel.TFrame")
+        right = ttk.Frame(right_holder, width=right_w, style="Sidebar.TFrame")
         right.grid(row=0, column=0, sticky="ns")
         right.grid_propagate(False)
         right.pack_propagate(False)
@@ -3254,30 +3058,30 @@ class IPTVApp(tk.Tk):
         right.grid_columnconfigure(0, weight=1)
         self.right_panel = right
 
-        self.right_body = ttk.Frame(right, style="Panel.TFrame")
+        self.right_body = ttk.Frame(right, style="Sidebar.TFrame")
         self.right_body.grid(row=0, column=0, sticky="nsew")
 
-        right_btn_col = ttk.Frame(right_holder, style="Panel.TFrame")
+        right_btn_col = ttk.Frame(right_holder, style="Collapse.TFrame")
         right_btn_col.grid(row=0, column=1, sticky="ns")
         right_btn_col.grid_rowconfigure(0, weight=1)
         right_btn_col.grid_rowconfigure(2, weight=1)
         self.right_btn_col = right_btn_col
         self.right_btn = PanelToggle(right_btn_col, command=self.toggle_right,
-                                     width=14, height=46)
+                                     width=7, height=46)
         self.right_btn.grid(row=1, column=0)
 
         self.replay_ch_var = tk.StringVar(value="未选择频道")
         ttk.Label(self.right_body, textvariable=self.replay_ch_var,
-                  style="Dim.TLabel", wraplength=260,
+                  style="SidebarDim.TLabel", wraplength=260,
                   justify=tk.LEFT).pack(anchor="w", padx=8, pady=(8, 2))
 
         self.epg_var = tk.StringVar(value="")
         ttk.Label(self.right_body, textvariable=self.epg_var,
-                  style="Dim.TLabel").pack(anchor="w", padx=8, pady=(0, 4))
+                  style="SidebarDim.TLabel").pack(anchor="w", padx=8, pady=(0, 4))
 
-        df = ttk.Frame(self.right_body, style="Panel.TFrame")
+        df = ttk.Frame(self.right_body, style="Sidebar.TFrame")
         df.pack(fill=tk.X, padx=8, pady=4)
-        ttk.Label(df, text="EPG", style="Dim.TLabel").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(df, text="EPG", style="SidebarDim.TLabel").pack(side=tk.LEFT, padx=(0, 4))
         self.date_var = tk.StringVar()
         self.date_cb = ttk.Combobox(df, textvariable=self.date_var, width=16,
                                     values=self.date_choices(), state="readonly")
@@ -3288,7 +3092,7 @@ class IPTVApp(tk.Tk):
         self.date_cb.bind("<Up>", lambda e: self._step_date(-1))
         self.date_cb.bind("<Down>", lambda e: self._step_date(1))
 
-        sf2 = ttk.Frame(self.right_body, style="Panel.TFrame")
+        sf2 = ttk.Frame(self.right_body, style="Sidebar.TFrame")
         sf2.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
         sb2 = ttk.Scrollbar(sf2, orient=tk.VERTICAL)
         sb2_h = ttk.Scrollbar(sf2, orient=tk.HORIZONTAL)
@@ -3297,7 +3101,7 @@ class IPTVApp(tk.Tk):
                                     yscrollcommand=sb2.set,
                                     xscrollcommand=sb2_h.set,
                                     font=("Microsoft YaHei UI", 10),
-                                    bg=COLORS["bg_input"],
+                                    bg=COLORS["bg_video"],
                                     fg=COLORS["fg_primary"],
                                     selectbackground=COLORS["select_bg"],
                                     selectforeground=COLORS["select_fg"],
@@ -3441,17 +3245,11 @@ class IPTVApp(tk.Tk):
         if not ffmpeg:
             return None, None
 
-        tcp = bool(self.cfg.get("rtsp_tcp", True))
         cmd = [ffmpeg, "-hide_banner", "-loglevel", "info", "-y"]
 
         low = url.lower()
 
         if low.startswith("rtsp://"):
-            if tcp:
-                cmd += ["-rtsp_transport", "tcp",
-                        "-rtsp_flags", "prefer_tcp"]
-            else:
-                cmd += ["-rtsp_transport", "udp"]
             cmd += ["-rw_timeout", "15000000"]
 
         elif low.startswith(("http://", "https://")):
@@ -3480,7 +3278,7 @@ class IPTVApp(tk.Tk):
 
         if mode == "video":
             ffprobe = find_ffprobe(ffmpeg)
-            v_codec, a_codec = _probe_stream_codecs(ffprobe, url, tcp, timeout=10)
+            v_codec, a_codec = _probe_stream_codecs(ffprobe, url, timeout=10)
 
             if v_codec in ("h264", "hevc", "h265", "mpeg4"):
                 video_args = ["-c:v", "copy"]
@@ -3510,7 +3308,7 @@ class IPTVApp(tk.Tk):
         else:
             ffprobe = find_ffprobe(ffmpeg)
             kb = nearest_mp3_bitrate(
-                probe_audio_bitrate(ffprobe, url, tcp, timeout=10))
+                probe_audio_bitrate(ffprobe, url, timeout=10))
             cmd += [
                 "-map", "0:a:0?",
                 "-vn",
@@ -4422,7 +4220,7 @@ class IPTVApp(tk.Tk):
         m.add_separator()
         has_media = bool(self.current_url)
         if has_media:
-            m.add_command(label="📷 截图画面 (F4)",
+            m.add_command(label="📷 截图 (F4)",
                           command=self.take_snapshot)
             m.add_command(label="🔍 查看流编码信息",
                           command=self.show_stream_info)
@@ -4470,8 +4268,7 @@ class IPTVApp(tk.Tk):
             self.status_var.set("字幕文件不存在：%s" % path)
             return False
         real = prepare_sub_file(path)
-        mrl = self._path_to_mrl(real)
-        self._vlc_call(self._vlc_add_subtitle, mrl, real)
+        self._mpv_call(self._mpv_add_subtitle, real)
         self._flash_seek_status("已加载字幕：%s" % os.path.basename(path))
         self.after(1000, self._ensure_sub_selected)
         return True
@@ -4479,18 +4276,17 @@ class IPTVApp(tk.Tk):
     def _ensure_sub_selected(self):
         if self.player is None or getattr(self, "_closing", False):
             return
-        self._vlc_call(self._vlc_ensure_sub)
 
     def disable_subtitle(self):
         if self.player is None:
             return
-        self._vlc_call(self._vlc_set_spu, -1)
+        self._mpv_call(self._mpv_set_sub_track, -1)
         self._flash_seek_status("已关闭字幕")
 
     def select_sub_track(self, tid):
         if self.player is None:
             return
-        self._vlc_call(self._vlc_set_spu, tid)
+        self._mpv_call(self._mpv_set_sub_track, tid)
 
     def adjust_sub_delay(self, delta_ms, reset=False):
         if self.player is None:
@@ -4500,24 +4296,24 @@ class IPTVApp(tk.Tk):
             if new is None:
                 return
             try:
-                self._flash_seek_status("字幕延迟：%+.1f 秒" % (new / 1000000.0))
+                self._flash_seek_status("字幕延迟：%+.1f 秒" % new)
             except Exception:
                 pass
 
-        self._vlc_call(self._vlc_adjust_spu_delay, delta_ms, reset, done=_done)
+        self._mpv_call(self._mpv_adjust_sub_delay, delta_ms, reset, done=_done)
 
     def _rebuild_sub_track_menu(self):
         m = self.sub_track_menu
         m.delete(0, tk.END)
-        tracks = list(self._cache.get("spu_tracks") or [])
-        cur = self._cache.get("spu_current", -1)
+        tracks = list(self._cache.get("sub_tracks") or [])
+        cur = self._cache.get("sub_current", -1)
         if not tracks:
             m.add_command(label="（无可用字幕轨道）", state="disabled")
             return
         self._sub_track_var = tk.IntVar(value=cur)
-        for tid, name in tracks:
-            if isinstance(name, bytes):
-                name = name.decode("utf-8", "replace")
+        for t in tracks:
+            tid = t.get("id", -1)
+            name = t.get("title") or t.get("lang") or ("轨道 %s" % tid)
             m.add_radiobutton(label=name, variable=self._sub_track_var,
                               value=tid,
                               command=lambda t=tid: self.select_sub_track(t))
@@ -4557,7 +4353,7 @@ class IPTVApp(tk.Tk):
             path = os.path.join(snap_dir, "%s_%s_%d.png" % (base, ts, n))
             n += 1
 
-        self._vlc_call(self._vlc_take_snapshot, path)
+        self._mpv_call(self._mpv_take_snapshot, path)
         self.status_var.set("正在保存截图…")
         self.after(600, lambda p=path: self._check_snapshot(p))
 
@@ -4610,10 +4406,9 @@ class IPTVApp(tk.Tk):
             return
 
         self.status_var.set("正在分析流编码信息…")
-        tcp = bool(self.cfg.get("rtsp_tcp", True))
 
         def worker():
-            data = _ffprobe_full_info(ffprobe, url, tcp, timeout=15)
+            data = _ffprobe_full_info(ffprobe, url, timeout=15)
             try:
                 self.after(0, lambda: self._show_stream_info_dialog(url, data))
             except Exception:
@@ -4825,13 +4620,13 @@ class IPTVApp(tk.Tk):
             pass
 
     def _update_local_media_progress(self):
-        t = self._cache.get("time", 0)
-        l = self._cache.get("length", 0)
+        t = self._cache.get("time", 0.0)
+        l = self._cache.get("length", 0.0)
         if l and l > 0:
             self.seek_bar.set_enabled(True)
             pos = max(0, min(1000, int(t * 1000 / l)))
             self.seek_bar.set_value(pos)
-            self.time_var.set("%s / %s" % (fmt_ms(t), fmt_ms(l)))
+            self.time_var.set("%s / %s" % (fmt_ms(t * 1000), fmt_ms(l * 1000)))
         else:
             self.seek_bar.set_enabled(False)
             self.seek_bar.set_value(0)
@@ -4899,55 +4694,50 @@ class IPTVApp(tk.Tk):
             if phase == "commit":
                 self.status_var.set("当前使用外部播放器，无法在程序内拖动进度")
             return
-        length = self._cache.get("length", 0)
+        length = self._cache.get("length", 0.0)
         if not length or length <= 0:
             if phase == "commit":
                 self.status_var.set("媒体长度尚未就绪，暂时无法拖动")
             return
 
-        target_ms = int(length * float(value) / 1000.0)
-        target_ms = max(0, min(length, target_ms))
+        target_ms = int(length * float(value) / 1000.0 * 1000)
+        target_ms = max(0, min(int(length * 1000), target_ms))
 
         if phase == "preview":
-            self.time_var.set("%s / %s" % (fmt_ms(target_ms), fmt_ms(length)))
+            self.time_var.set("%s / %s" % (fmt_ms(target_ms), fmt_ms(length * 1000)))
             return
 
-        if not self._cache.get("seekable", False):
-            self.status_var.set("该媒体不支持跳转")
-            return
-
-        self._vlc_call(self._vlc_set_time, target_ms)
-        self.time_var.set("%s / %s" % (fmt_ms(target_ms), fmt_ms(length)))
+        self._mpv_call(self._mpv_seek, target_ms)
+        self.time_var.set("%s / %s" % (fmt_ms(target_ms), fmt_ms(length * 1000)))
         self._flash_seek_status("已跳转到 %s" % fmt_ms(target_ms))
 
     def _seek_local_media_relative(self, delta_ms):
         if self.player is None:
             self.status_var.set("当前使用外部播放器，无法在程序内快进/快退")
             return
-        t = self._cache.get("time", 0)
-        l = self._cache.get("length", 0)
+        t = self._cache.get("time", 0.0)
+        l = self._cache.get("length", 0.0)
 
         if not l or l <= 0:
             self.status_var.set("媒体长度尚未就绪或不可 seek，请稍候再试")
             return
         if t < 0:
-            t = 0
+            t = 0.0
 
-        nt = max(0, min(l, t + int(delta_ms)))
+        nt = max(0.0, min(l, t + int(delta_ms) / 1000.0))
 
-        if not self._cache.get("seekable", False):
-            self.status_var.set("该媒体不支持跳转（常见于未开启 Range 的 WebDAV）")
-            return
-
-        self._vlc_call(self._vlc_set_time, nt)
-        self.time_var.set("%s / %s" % (fmt_ms(nt), fmt_ms(l)))
-        self._flash_seek_status("已跳转到 %s" % fmt_ms(nt))
+        self._mpv_call(self._mpv_seek, int(nt * 1000))
+        self.time_var.set("%s / %s" % (fmt_ms(nt * 1000), fmt_ms(l * 1000)))
+        self._flash_seek_status("已跳转到 %s" % fmt_ms(nt * 1000))
 
     def _update_progress(self):
         self._progress_after_id = None
-        if self._player_error_pending:
-            self._player_error_pending = False
-            self._on_player_error()
+        try:
+            if self.player is not None:
+                self._mpv_refresh_cache()
+        except Exception:
+            pass
+
         try:
             if self.seek_bar.is_dragging():
                 pass
@@ -5697,14 +5487,26 @@ class IPTVApp(tk.Tk):
             return None
         return self.slot_items[sel[0]]
 
+    def _resolve_default_m3u(self):
+        path = self.cfg.get("m3u_file") or DEFAULT_M3U
+        p = (path or "").strip().strip('"')
+        if p:
+            p = os.path.expanduser(p)
+            if not os.path.isabs(p):
+                p = os.path.join(APP_DIR, p)
+            p = os.path.normpath(p)
+        else:
+            p = DEFAULT_M3U
+        return p
+
     def load_default(self):
-        path = resolve_m3u_path(self.cfg)
-        if os.path.exists(path):
-            self.load_m3u(path)
+        p = self._resolve_default_m3u()
+        if os.path.exists(p):
+            self.load_m3u(p)
         else:
             self.status_var.set(
                 "未找到默认 m3u：%s，请通过“文件 → 打开 m3u 文件”加载，"
-                "或在 iptv_config.json 中设置 m3u_file" % path)
+                "或在 iptv_config.json 中设置 m3u_file" % p)
 
     def open_m3u(self):
         p = filedialog.askopenfilename(
@@ -6066,8 +5868,11 @@ class IPTVApp(tk.Tk):
         else:
             self._schedule_audio_poster_check()
 
-        opts = [":http-reconnect=true", ":http-continuous",
-                ":avcodec-hw=%s" % ("any" if self.cfg.get("hw_decode", True) else "none")]
+        opts = {
+            "http-reconnect": True,
+            "http-continuous": True,
+            "hwdec": "auto" if self.cfg.get("hw_decode", True) else "no",
+        }
         vol = max(0, min(150, int(self.vol_var.get())))
         muted = bool(self._muted)
         self._submit_play(url, opts, vol, muted)
@@ -6270,51 +6075,27 @@ class IPTVApp(tk.Tk):
         self.refresh_slots()
 
     def init_player(self):
-        load_vlc_module()
-        if vlc is None:
-            if (VLC_IMPORT_ERROR == "missing" and self.cfg.get("auto_install_vlc", True)
-                    and not getattr(sys, "frozen", False)):
-                self.start_auto_install()
-            elif VLC_IMPORT_ERROR and VLC_IMPORT_ERROR.startswith("libvlc"):
-                self.status_var.set("找不到可用的 VLC 播放器本体，暂用外部播放器")
-                if not getattr(self, "_libvlc_prompted", False):
-                    self._libvlc_prompted = True
-                    self.after(500, self.on_libvlc_problem)
-            else:
-                self.status_var.set("未检测到 python-vlc/VLC，将使用外部播放器（vlc/mpv/ffplay）")
+        load_mpv_module()
+        if mpv is None:
+            self.status_var.set("未检测到 python-mpv，将使用外部播放器")
+            if not getattr(self, "_mpv_prompted", False):
+                self._mpv_prompted = True
+                self.after(500, self.on_mpv_problem)
             return
         try:
-            self.vlc_instance = vlc.Instance(
-                "--network-caching=1500",
-                "--no-video-title-show",
-                "--quiet",
+            self.player = mpv.MPV(
+                wid=str(self.video.winfo_id()),
+                osc=True,
+                input_default_bindings=False,
+                input_vo_keyboard=False,
+                hwdec="auto" if self.cfg.get("hw_decode", True) else "no",
+                keep_open="yes",
+                network_timeout=10,
             )
-            self.player = self.vlc_instance.media_player_new()
-            self.update_idletasks()
-            wid = self.video.winfo_id()
-            if sys.platform.startswith("win"):
-                self.player.set_hwnd(wid)
-            elif sys.platform == "darwin":
-                self.player.set_nsobject(wid)
-            else:
-                self.player.set_xwindow(wid)
-            self.player.video_set_mouse_input(False)
-            self.player.video_set_key_input(False)
-            self.player.audio_set_volume(self.vol_var.get())
-
-            self._player_error_cb = lambda e: setattr(
-                self, "_player_error_pending", True)
-            em = self.player.event_manager()
-            em.event_attach(vlc.EventType.MediaPlayerEncounteredError,
-                            self._player_error_cb)
-
-            if self._vlc_thread is None:
-                self._vlc_thread = threading.Thread(
-                    target=self._vlc_worker_loop, daemon=True)
-                self._vlc_thread.start()
+            self.status_var.set("MPV 播放器已就绪")
         except Exception as e:
             self.player = None
-            self.status_var.set("VLC 初始化失败，改用外部播放器：%s" % e)
+            self.status_var.set("MPV 初始化失败，改用外部播放器：%s" % e)
 
     def _on_player_error(self):
         if getattr(self, "_closing", False):
@@ -6326,125 +6107,16 @@ class IPTVApp(tk.Tk):
         except Exception:
             pass
 
-    def start_auto_install(self):
-        if getattr(self, "installing", False):
-            return
-        self.installing = True
-        self.install_result = None
-        self.status_var.set("未检测到 python-vlc，正在后台自动安装…（期间可临时使用外部播放器）")
-        threading.Thread(target=self._install_worker, daemon=True).start()
-        self.after(500, self._poll_install)
-
-    def _install_worker(self):
-        cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "python-vlc"]
-        kw = {"capture_output": True, "text": True, "errors": "replace", "timeout": 300}
-        if sys.platform.startswith("win"):
-            kw["creationflags"] = 0x08000000
-        try:
-            r = subprocess.run(cmd, **kw)
-            out = (r.stdout or "") + (r.stderr or "")
-            if r.returncode != 0 and "externally-managed" in out:
-                r = subprocess.run(cmd + ["--break-system-packages"], **kw)
-                out = (r.stdout or "") + (r.stderr or "")
-            self.install_result = (r.returncode == 0, out[-600:])
-        except Exception as e:
-            self.install_result = (False, str(e))
-
-    def _poll_install(self):
-        if self.install_result is None:
-            self.after(500, self._poll_install)
-            return
-        global vlc, VLC_IMPORT_ERROR
-        self.installing = False
-        ok, msg = self.install_result
-        if not ok:
-            self.status_var.set("python-vlc 自动安装失败，请手动执行：pip install python-vlc")
-            messagebox.showwarning("自动安装失败",
-                                   "python-vlc 安装失败，请检查网络后手动执行：\n"
-                                   "pip install python-vlc\n\n" + msg)
-            return
-        self._try_enable_vlc("python-vlc 安装成功，已启用内嵌播放，请重新选择频道播放")
-
-    def _try_enable_vlc(self, ok_msg):
-        global vlc, VLC_IMPORT_ERROR, VLC_MATCH_DIR, VLC_INSTALLS
-        importlib.invalidate_caches()
-        try:
-            usp = site.getusersitepackages()
-            if os.path.isdir(usp) and usp not in sys.path:
-                sys.path.append(usp)
-        except Exception:
-            pass
-        if sys.platform.startswith("win"):
-            VLC_MATCH_DIR, VLC_INSTALLS = prepare_vlc_path()
-        try:
-            import vlc as _v
-            vlc = _v
-            VLC_IMPORT_ERROR = None
-            self.init_player()
-            if self.player is not None:
-                self.status_var.set(ok_msg)
-        except ModuleNotFoundError:
-            self.status_var.set("python-vlc 已安装，请重启程序后生效")
-        except (Exception, SystemExit) as e:
-            VLC_IMPORT_ERROR = "libvlc:%s: %s" % (type(e).__name__, e)
-            self.status_var.set("仍然无法加载 VLC：" + VLC_IMPORT_ERROR)
-
-    def on_libvlc_problem(self):
-        text = describe_vlc_problem(VLC_IMPORT_ERROR)
-        if sys.platform.startswith("win") and not VLC_MATCH_DIR:
-            if messagebox.askyesno(
-                    "缺少 VLC 组件",
-                    text + "\n\n不想安装 VLC？可以自动下载官方的免安装组件：\n"
-                           "• 来源：VideoLAN 官方（下载后校验 SHA-256）\n"
-                           "• 大小：压缩包约 80 MB\n"
-                           "• 位置：%s\n"
-                           "• 不安装、不写注册表，删除该文件夹即可清除\n\n"
-                           "是否现在下载？选“否”则暂用外部播放器。" % portable_vlc_target()):
-                self.start_portable_download()
-        else:
-            messagebox.showwarning("找不到 VLC 组件", text)
-
-    def manual_portable_download(self):
-        if not sys.platform.startswith("win"):
-            messagebox.showinfo("提示", "免安装组件下载仅支持 Windows。请用系统包管理器安装 VLC。")
-        elif self.player is not None:
-            messagebox.showinfo("提示", "内嵌播放器已经可用，无需下载。")
-        elif getattr(self, "downloading", False):
-            messagebox.showinfo("提示", "正在下载中，请稍候。")
-        else:
-            self.start_portable_download()
-
-    def start_portable_download(self):
-        if getattr(self, "downloading", False):
-            return
-        self.downloading = True
-        self.install_result = None
-        self.dl_text = "准备下载 VLC 免安装组件…"
-        threading.Thread(target=self._portable_worker, args=(portable_vlc_target(),),
-                         daemon=True).start()
-        self.after(300, self._poll_portable)
-
-    def _portable_worker(self, target):
-        try:
-            download_portable_vlc(target, lambda t: setattr(self, "dl_text", t))
-            self.install_result = (True, "")
-        except Exception as e:
-            self.install_result = (False, str(e))
-
-    def _poll_portable(self):
-        if self.install_result is None:
-            self.status_var.set(self.dl_text)
-            self.after(300, self._poll_portable)
-            return
-        self.downloading = False
-        ok, msg = self.install_result
-        if ok:
-            self._try_enable_vlc("VLC 组件已就绪（免安装），已启用内嵌播放，请重新选择频道播放")
-        else:
-            self.status_var.set("VLC 组件下载失败：" + msg)
-            messagebox.showwarning(
-                "下载失败",
-                "%s\n\n可稍后重试（文件 → 下载免安装 VLC 组件），或在“回看参数设置”里指定 PotPlayer 等外部播放器。" % msg)
+    def on_mpv_problem(self):
+        text = describe_mpv_problem(MPV_IMPORT_ERROR)
+        if messagebox.askyesno(
+                "缺少 MPV 组件",
+                text + "\n\n是否打开下载页面？"):
+            import webbrowser
+            try:
+                webbrowser.open("https://github.com/mpv-player/mpv/releases/tag/git-release")
+            except Exception:
+                pass
 
     def _play_local_file(self, path, title):
         self._stop_recording_for_switch()
@@ -6576,14 +6248,10 @@ class IPTVApp(tk.Tk):
                 pass
         if self.player is not None:
             low = url.lower()
-            opts = []
-            if low.startswith("rtsp://"):
-                if self.cfg.get("rtsp_tcp", True):
-                    opts.append(":rtsp-tcp")
-            else:
-                opts.append(":http-reconnect=true")
-            opts.append(":avcodec-hw=%s" %
-                        ("any" if self.cfg.get("hw_decode", True) else "none"))
+            opts = {}
+            if not low.startswith("rtsp://"):
+                opts["http-reconnect"] = True
+            opts["hwdec"] = "auto" if self.cfg.get("hw_decode", True) else "no"
             vol = max(0, min(150, int(self.vol_var.get())))
             muted = bool(self._muted)
             self._submit_play(url, opts, vol, muted)
@@ -6612,9 +6280,7 @@ class IPTVApp(tk.Tk):
                 return
             except Exception:
                 pass
-        is_rtsp = url.lower().startswith("rtsp://")
-        for exe, args in (("vlc", []), ("mpv", []),
-                          ("ffplay", ["-rtsp_transport", "tcp"] if is_rtsp else [])):
+        for exe, args in (("vlc", []), ("mpv", []), ("ffplay", [])):
             path = shutil.which(exe)
             if path:
                 try:
@@ -6624,7 +6290,7 @@ class IPTVApp(tk.Tk):
                     continue
         messagebox.showerror(
             "无法播放",
-            "未找到可用播放器。\n请执行 pip install python-vlc 并安装 VLC，\n"
+            "未找到可用播放器。\n请安装 python-mpv 和 mpv 组件，\n"
             "或将 vlc/mpv/ffplay 加入 PATH。")
 
     def kill_external(self):
@@ -6710,7 +6376,7 @@ class IPTVApp(tk.Tk):
         if ext:
             if self.player is not None:
                 self._cancel_play_req()
-                self._vlc_call(self._vlc_stop)
+                self._mpv_call(self._mpv_stop)
             self.kill_external()
             try:
                 self.ext_proc = subprocess.Popen([ext, url])
@@ -6742,38 +6408,19 @@ class IPTVApp(tk.Tk):
 
     def on_decode_option_changed(self):
         self.cfg["hw_decode"] = bool(self.hw_var.get())
-        self.cfg["rtsp_tcp"] = bool(self.tcp_var.get())
         self.save_config()
         if self.player is None or not self.current_url:
             return
-        st = self._cache.get("state")
-        active = False
-        if vlc is not None:
-            try:
-                active = st in (vlc.State.Opening, vlc.State.Buffering,
-                                vlc.State.Playing, vlc.State.Paused)
-            except Exception:
-                active = False
-        if active:
-            self.play_url(self.current_url, self.current_title, self.current_live)
-            if not self.recording:
-                self.status_var.set("已切换（硬解=%s, RTSP-TCP=%s）并重新播放：%s" % (
-                    "开" if self.cfg["hw_decode"] else "关",
-                    "开" if self.cfg["rtsp_tcp"] else "关", self.current_title))
+        self.play_url(self.current_url, self.current_title, self.current_live)
+        if not self.recording:
+            self.status_var.set("已切换（硬解=%s）并重新播放：%s" % (
+                "开" if self.cfg["hw_decode"] else "关", self.current_title))
 
     def toggle_pause(self):
         if self.player is None:
             return
-        st = self._cache.get("state")
-        if vlc is not None:
-            try:
-                if st in (vlc.State.Ended, vlc.State.Stopped, vlc.State.Error):
-                    return
-            except Exception:
-                pass
-
         if self._is_file_playback():
-            self._vlc_call(self._vlc_pause)
+            self._mpv_call(self._mpv_pause)
             return
 
         if self._net_paused:
@@ -6788,7 +6435,7 @@ class IPTVApp(tk.Tk):
             if live:
                 self._refresh_live_bar()
         else:
-            self._vlc_call(self._vlc_pause)
+            self._mpv_call(self._mpv_pause)
             self._net_paused = True
             self._flash_seek_status("已暂停（再按空格或点击画面继续）")
 
@@ -6805,7 +6452,7 @@ class IPTVApp(tk.Tk):
         self._net_paused = False
         if self.player is not None:
             self._cancel_play_req()
-            self._vlc_call(self._vlc_stop)
+            self._mpv_call(self._mpv_stop)
         self.kill_external()
         self._clear_replay_range()
         self.current = None
@@ -6825,7 +6472,7 @@ class IPTVApp(tk.Tk):
         except Exception:
             pass
         vol = max(0, min(150, int(self.vol_var.get())))
-        self._vlc_call(self._vlc_set_volume, vol, bool(self._muted))
+        self._mpv_call(self._mpv_set_volume, vol, bool(self._muted))
         self._flash_seek_status("已静音" if self._muted else "已取消静音")
 
     def on_volume(self, _v=None):
@@ -6845,7 +6492,7 @@ class IPTVApp(tk.Tk):
             self.vol_pct_var.set("%d%%" % v)
         except Exception:
             pass
-        self._vlc_call(self._vlc_set_volume, v, bool(self._muted))
+        self._mpv_call(self._mpv_set_volume, v, bool(self._muted))
 
     def _apply_left_visible(self):
         if self.left_visible:
@@ -6854,7 +6501,7 @@ class IPTVApp(tk.Tk):
             self.left_panel.grid()
         else:
             self.left_panel.grid_remove()
-        if not self.fullscreen:
+        if not self.fullscreen and self.left_visible:
             self.left_splitter.grid(row=0, column=1, sticky="ns")
         else:
             self.left_splitter.grid_remove()
@@ -6866,7 +6513,7 @@ class IPTVApp(tk.Tk):
             self.right_panel.grid()
         else:
             self.right_panel.grid_remove()
-        if not self.fullscreen:
+        if not self.fullscreen and self.right_visible:
             self.right_splitter.grid(row=0, column=3, sticky="ns")
         else:
             self.right_splitter.grid_remove()
@@ -6999,19 +6646,12 @@ class IPTVApp(tk.Tk):
                 row=i, column=1, padx=10, pady=6)
             vars_[key] = v
 
-        tcp_var = tk.BooleanVar(value=bool(self.cfg.get("rtsp_tcp", True)))
-        ttk.Checkbutton(win, text="RTSP 使用 TCP（仅对 rtsp:// 生效）",
-                        variable=tcp_var).grid(row=len(rows), column=1,
-                                               sticky="w", padx=10)
-
         def ok():
             try:
                 self.cfg["template"] = vars_["template"].get().strip()
                 self.cfg["replay_player"] = vars_["replay_player"].get().strip().strip('"')
                 keys_raw = vars_["http_replay_keys"].get().strip()
                 self.cfg["http_replay_keys"] = [k.strip() for k in keys_raw.split(",") if k.strip()]
-                self.cfg["rtsp_tcp"] = bool(tcp_var.get())
-                self.tcp_var.set(self.cfg["rtsp_tcp"])
                 self.cfg["userid"] = vars_["userid"].get().strip()
                 self.cfg["authinfo"] = vars_["authinfo"].get().strip()
                 self.cfg["tz_offset"] = int(vars_["tz_offset"].get())
@@ -7114,7 +6754,7 @@ class IPTVApp(tk.Tk):
 
         try:
             if self.player is not None:
-                self._vlc_call(self._vlc_cleanup)
+                self._mpv_call(self._mpv_stop)
         except Exception:
             pass
 
@@ -7124,33 +6764,12 @@ class IPTVApp(tk.Tk):
         self._closing_after_id = None
 
         try:
-            self._vlc_q.put(None)
-        except Exception:
-            pass
-        if self._vlc_thread is not None:
-            try:
-                self._vlc_thread.join(timeout=2.0)
-            except Exception:
-                pass
-            self._vlc_thread = None
-
-        try:
             if self.player is not None:
                 try:
-                    self.player.release()
+                    self.player.terminate()
                 except Exception:
                     pass
                 self.player = None
-        except Exception:
-            pass
-
-        try:
-            if self.vlc_instance is not None:
-                try:
-                    self.vlc_instance.release()
-                except Exception:
-                    pass
-                self.vlc_instance = None
         except Exception:
             pass
 

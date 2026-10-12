@@ -1,3 +1,6 @@
+软件简介：
+采用Libmpv-2.dll作为播放内核，依赖python-mpv
+
 软件特性：
 1. 支持HTTP、RTSP协议播放；
 2. 支持本地IPTV节目回看（7天内）；
@@ -9,8 +12,6 @@
 8. 支持本地IPTV EPG数据优先显示，同时支持网络EPG数据地址自定义，自动定时更新EPG数据；
 9. 支持频道别名映射多数据源映射。
 
-已知BUG：
-1. 当采用硬解码时，播放HLS+jpg加密流时，切换频道后程序会闪退。（建议：默认采用软解码来避免该问题）
 
 <img width="1920" height="1032" alt="image" src="https://github.com/user-attachments/assets/774197ea-053e-422e-845a-32870068d973" />
 
