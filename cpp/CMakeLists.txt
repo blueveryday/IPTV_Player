@@ -16,6 +16,18 @@ find_package(ZLIB REQUIRED)
 # ---- libmpv -------------------------------------------------------------
 # Linux/macOS: pkg-config.  Windows: set -DMPV_ROOT=<解压后的 libmpv 开发包目录>
 set(MPV_ROOT "" CACHE PATH "libmpv development package root (contains include/mpv/client.h)")
+# MSYS2 下 pkg-config 返回 /ucrt64/include 这类 POSIX 路径，原生 Windows 的 CMake 不认识，
+# 因此 Windows 上改用 MSYSTEM_PREFIX（如 C:/msys64/ucrt64）直接查找。
+if(WIN32 AND NOT MPV_ROOT AND DEFINED ENV{MSYSTEM_PREFIX})
+  execute_process(COMMAND cygpath -m "$ENV{MSYSTEM_PREFIX}" OUTPUT_VARIABLE _msys_prefix
+                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(NOT _msys_prefix)
+    file(TO_CMAKE_PATH "$ENV{MSYSTEM_PREFIX}" _msys_prefix)
+  endif()
+  if(EXISTS "${_msys_prefix}/include/mpv/client.h")
+    set(MPV_ROOT "${_msys_prefix}")
+  endif()
+endif()
 find_package(PkgConfig QUIET)
 set(MPV_FOUND FALSE)
 if(PkgConfig_FOUND AND NOT MPV_ROOT)
