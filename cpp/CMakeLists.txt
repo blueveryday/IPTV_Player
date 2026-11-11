@@ -69,6 +69,14 @@ set(SOURCES
   src/mainwindow_dialogs.cpp
 )
 
+# Windows：给 exe 嵌入图标（资源管理器/任务栏显示）
+if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../src/asset/iptv.ico")
+  enable_language(RC)
+  set(IPTV_ICON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../src/asset/iptv.ico")
+  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/app.rc.in" "${CMAKE_CURRENT_BINARY_DIR}/app.rc" @ONLY)
+  list(APPEND SOURCES "${CMAKE_CURRENT_BINARY_DIR}/app.rc")
+endif()
+
 add_executable(IPTVPlayer WIN32 ${SOURCES})
 target_link_libraries(IPTVPlayer PRIVATE
   Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Network Qt6::Core5Compat
