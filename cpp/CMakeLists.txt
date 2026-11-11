@@ -84,8 +84,21 @@ endif()
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/..")
 add_custom_command(TARGET IPTVPlayer POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:IPTVPlayer>/src"
-  COMMAND ${CMAKE_COMMAND} -E copy_directory "${REPO_ROOT}/src/asset" "$<TARGET_FILE_DIR:IPTVPlayer>/src/asset"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory "${REPO_ROOT}/src" "$<TARGET_FILE_DIR:IPTVPlayer>/src"
   COMMENT "Copying runtime assets")
+
+# Windows：自动把 DLL / Qt 插件 / ffmpeg / ffprobe 收集进 build 目录，使其可独立运行
+if(WIN32 AND NOT MSVC)
+  set(IPTV_DEPLOY_PREFIX "$ENV{MSYSTEM_PREFIX}" CACHE PATH "MSYS2 前缀（如 C:/msys64/ucrt64）")
+  if(NOT IPTV_DEPLOY_PREFIX)
+    get_filename_component(_cxx_dir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(IPTV_DEPLOY_PREFIX "${_cxx_dir}/.." ABSOLUTE)
+  endif()
+  add_custom_command(TARGET IPTVPlayer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:IPTVPlayer> -DPREFIX=${IPTV_DEPLOY_PREFIX}
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/deploy.cmake"
+    COMMENT "Deploying runtime DLLs, Qt plugins, ffmpeg")
+endif()
 file(GLOB IPTV_M3U_FILES "${REPO_ROOT}/iptv_*.m3u")
 foreach(f ${IPTV_M3U_FILES})
   add_custom_command(TARGET IPTVPlayer POST_BUILD
@@ -93,5 +106,5 @@ foreach(f ${IPTV_M3U_FILES})
 endforeach()
 
 install(TARGETS IPTVPlayer RUNTIME DESTINATION .)
-install(DIRECTORY "${REPO_ROOT}/src/asset" DESTINATION src)
+install(DIRECTORY "${REPO_ROOT}/src/" DESTINATION src)
 install(FILES ${IPTV_M3U_FILES} DESTINATION .)
