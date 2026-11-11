@@ -1,0 +1,67 @@
+name: Build C++ (Windows)
+
+on:
+  push:
+    branches: [main, cpp-rewrite]
+    paths: ['cpp/**', 'src/**', 'iptv_*.m3u', '.github/workflows/build-cpp.yml']
+  pull_request:
+    paths: ['cpp/**', 'src/**', 'iptv_*.m3u', '.github/workflows/build-cpp.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 打 tag 时发布 Release 需要
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSYS2 (UCRT64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-qt6-base
+            mingw-w64-ucrt-x86_64-qt6-5compat
+            mingw-w64-ucrt-x86_64-mpv
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-ffmpeg
+            zip
+
+      - name: Configure
+        run: cmake -S cpp -B cpp/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (含 DLL / Qt 插件 / ffmpeg 自动部署)
+        run: cmake --build cpp/build
+
+      - name: Package
+        run: |
+          rm -rf dist && mkdir -p dist/IPTVPlayer
+          cp -r cpp/build/. dist/IPTVPlayer/
+          cd dist/IPTVPlayer
+          rm -rf CMakeFiles IPTVPlayer_autogen .ninja_deps .ninja_log build.ninja \
+                 CMakeCache.txt cmake_install.cmake app.rc *_autogen
+          ls
+          cd .. && zip -r -q IPTVPlayer-windows-x64.zip IPTVPlayer
+          ls -lh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPTVPlayer-windows-x64
+          path: dist/IPTVPlayer-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Release (tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/IPTVPlayer-windows-x64.zip
